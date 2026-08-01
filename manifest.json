@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Claude Counter",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "browser_specific_settings": {
     "gecko": {
       "id": "{236c6889-52b6-4454-bc4b-5a2ad18effa2}",
