@@ -454,6 +454,7 @@
 				this.lengthBar = bar;
 				const fill = document.createElement('div');
 				fill.className = 'cc-bar__fill';
+				if (pct >= 90) fill.classList.add('cc-warn');
 				fill.style.width = `${pct}%`;
 				bar.appendChild(fill);
 				this.refreshProgressChrome();
