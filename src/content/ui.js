@@ -511,15 +511,33 @@
 		setUsage(usage, { isNewChat = false, activeModel = 'sonnet' } = {}) {
 			this.isNewChat = !!isNewChat;
 			this.activeModel = activeModel;
-			if (this.fiveHourIndicator) {
-				this.fiveHourIndicator.style.display = isNewChat ? '' : 'none';
-			}
 
 			this.refreshProgressChrome();
 			const modelsFiveHour = usage?.models_five_hour || {};
 			const fallbackFiveHour = usage?.five_hour || null;
 			const weekly = usage?.seven_day || null;
 			const overuse = usage?.overuse || null;
+
+			let fiveHourResetMs = null;
+			if (fallbackFiveHour?.resets_at) {
+				fiveHourResetMs = Date.parse(fallbackFiveHour.resets_at);
+			} else {
+				for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+					if (modelsFiveHour[m]?.resets_at) {
+						fiveHourResetMs = Date.parse(modelsFiveHour[m].resets_at);
+						break;
+					}
+				}
+			}
+			this.fiveHourResetMs = fiveHourResetMs;
+
+			if (this.fiveHourIndicator) {
+				this.fiveHourIndicator.style.display = isNewChat ? '' : 'none';
+				if (isNewChat) {
+					const resetText = fiveHourResetMs ? ` · resets in ${formatResetCountdown(fiveHourResetMs)}` : '';
+					this.fiveHourIndicator.textContent = `5h limit${resetText}`;
+				}
+			}
 
 			const hasAnyUsage = !!fallbackFiveHour || !!weekly || !!overuse || Object.keys(modelsFiveHour).length > 0;
 			this.usageLine?.classList.toggle('cc-hidden', !hasAnyUsage);
@@ -683,6 +701,14 @@
 				if (idx !== -1) {
 					const prefix = this.weeklyUsageSpan.textContent.slice(0, idx + '· resets in '.length);
 					this.weeklyUsageSpan.textContent = `${prefix}${formatResetCountdown(this.weeklyResetMs)}`;
+				}
+			}
+
+			if (this.isNewChat && this.fiveHourResetMs && this.fiveHourIndicator?.textContent) {
+				const idx = this.fiveHourIndicator.textContent.indexOf('· resets in');
+				if (idx !== -1) {
+					const prefix = this.fiveHourIndicator.textContent.slice(0, idx + '· resets in '.length);
+					this.fiveHourIndicator.textContent = `${prefix}${formatResetCountdown(this.fiveHourResetMs)}`;
 				}
 			}
 
