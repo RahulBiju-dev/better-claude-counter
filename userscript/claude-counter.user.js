@@ -180,9 +180,9 @@
 	});
 
 	CC.MODEL_WIDTHS = Object.freeze({
-		haiku: '105px',
-		sonnet: '105px',
-		opus: '105px'
+		haiku: '75px',
+		sonnet: '75px',
+		opus: '75px'
 	});
 
 	CC.MODEL_USAGE_MULTIPLIERS = Object.freeze({
@@ -710,7 +710,7 @@
 			this.usageLine.appendChild(this.overuseGroup);
 
 			this.fiveHourIndicator = document.createElement('span');
-			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 ml-auto mr-4 whitespace-nowrap select-none';
+			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 ml-auto mr-4 whitespace-nowrap select-none flex-shrink-0';
 			this.fiveHourIndicator.textContent = '5-hour limit';
 			this.usageLine.appendChild(this.fiveHourIndicator);
 
@@ -962,7 +962,7 @@
 
 				if (isNewChat || m === activeModel) {
 					mg.group.classList.remove('cc-hidden');
-					const barWidth = isNewChat ? (CC.MODEL_WIDTHS?.[m] || '105px') : '200px';
+					const barWidth = isNewChat ? (CC.MODEL_WIDTHS?.[m] || '75px') : '200px';
 					mg.bar.style.width = barWidth;
 					mg.bar.style.flex = `0 0 ${barWidth}`;
 					if (session && typeof session.utilization === 'number') {
