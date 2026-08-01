@@ -37,9 +37,9 @@
 	});
 
 	CC.MODEL_WIDTHS = Object.freeze({
-		haiku: '75px',
-		sonnet: '75px',
-		opus: '75px'
+		haiku: '96px',
+		sonnet: '96px',
+		opus: '96px'
 	});
 
 	CC.MODEL_USAGE_MULTIPLIERS = Object.freeze({
