@@ -26,4 +26,26 @@
 		BOLD_LIGHT: '#141413',
 		BOLD_DARK: '#faf9f5'
 	});
+
+	CC.MODELS = Object.freeze(['haiku', 'sonnet', 'opus']);
+
+	CC.MODEL_NAMES = Object.freeze({
+		haiku: 'Haiku',
+		sonnet: 'Sonnet',
+		opus: 'Opus',
+		fable: 'Fable'
+	});
+
+	CC.MODEL_WIDTHS = Object.freeze({
+		haiku: '105px',
+		sonnet: '105px',
+		opus: '105px'
+	});
+
+	CC.MODEL_USAGE_MULTIPLIERS = Object.freeze({
+		haiku: 1 / 3,
+		sonnet: 1.0,
+		opus: 2.0
+	});
 })();
+

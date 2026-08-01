@@ -15,6 +15,7 @@
 	cursor: pointer;
 	user-select: none;
 	transition: opacity 150ms ease;
+	flex-wrap: nowrap;
 }
 
 .cc-usageRow--dim {
@@ -24,9 +25,13 @@
 .cc-usageGroup {
 	display: flex;
 	align-items: center;
-	gap: 8px;
-	flex: 1;
+	gap: 6px;
+	flex: 1 1 auto;
 	min-width: 0;
+}
+
+.cc-usageGroup--model {
+	flex: 0 0 auto;
 }
 
 .cc-usageGroup--single {
@@ -34,6 +39,11 @@
 }
 
 .cc-usageGroup--weekly {
+	justify-content: flex-end;
+}
+
+.cc-usageGroup--overuse {
+	flex: 0 0 auto;
 	justify-content: flex-end;
 }
 
