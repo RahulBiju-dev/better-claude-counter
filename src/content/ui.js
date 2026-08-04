@@ -97,8 +97,9 @@
 	}
 
 	class CounterUI {
-		constructor({ onUsageRefresh } = {}) {
+		constructor({ onUsageRefresh, onPlanCycle } = {}) {
 			this.onUsageRefresh = onUsageRefresh || null;
+			this.onPlanCycle = onPlanCycle || null;
 
 			this.headerContainer = null;
 			this.headerDisplay = null;
@@ -111,19 +112,14 @@
 			this.pendingCache = false;
 
 			this.usageLine = null;
+			// New-chat screen: the scaled multimodal preview (Sonnet exact, others
+			// scaled by CC.MODEL_USAGE_MULTIPLIERS).
 			this.modelGroups = {};
-			this.weeklyGroup = null;
-			this.weeklyUsageSpan = null;
-			this.weeklyBar = null;
-			this.weeklyBarFill = null;
-			this.weeklyMarker = null;
-			this.weeklyResetMs = null;
-			this.weeklyWindowStartMs = null;
-			this.overuseGroup = null;
-			this.overuseUsageSpan = null;
-			this.overuseBar = null;
-			this.overuseBarFill = null;
+			// Inside a conversation: the real rate-limit windows, unscaled.
+			this.windowGroups = {};
 			this.fiveHourIndicator = null;
+			this.planButton = null;
+			this.plan = null;
 			this.isNewChat = false;
 			this.activeModel = 'sonnet';
 			this.refreshingUsage = false;
@@ -157,13 +153,12 @@
 			};
 
 			applyBarChrome(this.lengthBar, { fillWarn: fillColor });
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				if (this.modelGroups?.[m]?.bar) {
-					applyBarChrome(this.modelGroups[m].bar, { fillWarn: CC.COLORS.RED_WARNING });
-				}
+			for (const group of [...Object.values(this.modelGroups || {}), ...Object.values(this.windowGroups || {})]) {
+				applyBarChrome(group?.bar, { fillWarn: CC.COLORS.RED_WARNING });
 			}
-			applyBarChrome(this.weeklyBar, { fillWarn: CC.COLORS.RED_WARNING });
-			applyBarChrome(this.overuseBar, { fillWarn: CC.COLORS.RED_WARNING });
+			if (this.planButton) {
+				this.planButton.style.setProperty('--cc-stroke', strokeColor);
+			}
 		}
 
 		initialize() {
@@ -229,16 +224,17 @@
 			this.usageLine.className =
 				'text-text-400 text-[11px] cc-usageRow cc-hidden flex flex-row items-center gap-4 w-full flex-nowrap';
 
-			this.modelGroups = {};
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+			// A bar group: label + track + fill + window-progress marker. Used for
+			// both the new-chat model preview and the in-conversation windows, which
+			// differ only in label, width and whether the value is scaled.
+			const buildGroup = ({ modifier, width, labelFirst = true }) => {
 				const usageSpan = document.createElement('span');
 				usageSpan.className = 'cc-usageText';
 
 				const bar = document.createElement('div');
 				bar.className = 'cc-bar cc-bar--usage';
-				const widthPct = CC.MODEL_WIDTHS?.[m] || '15%';
-				bar.style.width = widthPct;
-				bar.style.flex = `0 0 ${widthPct}`;
+				bar.style.width = width;
+				bar.style.flex = `0 0 ${width}`;
 
 				const barFill = document.createElement('div');
 				barFill.className = 'cc-bar__fill';
@@ -249,60 +245,52 @@
 				bar.appendChild(marker);
 
 				const group = document.createElement('div');
-				group.className = 'cc-usageGroup cc-usageGroup--model';
-				group.appendChild(usageSpan);
-				group.appendChild(bar);
+				group.className = `cc-usageGroup ${modifier}`;
+				if (labelFirst) {
+					group.appendChild(usageSpan);
+					group.appendChild(bar);
+				} else {
+					group.appendChild(bar);
+					group.appendChild(usageSpan);
+				}
 
-				this.modelGroups[m] = {
-					group,
-					usageSpan,
-					bar,
-					barFill,
-					marker,
-					resetMs: null,
-					windowStartMs: null
-				};
 				this.usageLine.appendChild(group);
+				return { group, usageSpan, bar, barFill, marker, resetMs: null, windowStartMs: null };
+			};
+
+			this.modelGroups = {};
+			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+				this.modelGroups[m] = buildGroup({
+					modifier: 'cc-usageGroup--model',
+					width: CC.MODEL_WIDTHS?.[m] || '96px'
+				});
 			}
 
-			this.weeklyUsageSpan = document.createElement('span');
-			this.weeklyUsageSpan.className = 'cc-usageText';
+			this.windowGroups = {};
+			for (const win of (CC.WINDOWS || [])) {
+				this.windowGroups[win.key] = buildGroup({
+					modifier: `cc-usageGroup--window cc-usageGroup--${win.key}`,
+					width: CC.WINDOW_WIDTHS?.[win.key] || '200px',
+					// Weekly bars read bar-then-label, matching the previous layout.
+					labelFirst: win.key === 'five_hour'
+				});
+			}
 
-			this.weeklyBar = document.createElement('div');
-			this.weeklyBar.className = 'cc-bar cc-bar--usage';
-			this.weeklyBarFill = document.createElement('div');
-			this.weeklyBarFill.className = 'cc-bar__fill';
-			this.weeklyMarker = document.createElement('div');
-			this.weeklyMarker.className = 'cc-bar__marker cc-hidden';
-			this.weeklyMarker.style.left = '0%';
-			this.weeklyBar.appendChild(this.weeklyBarFill);
-			this.weeklyBar.appendChild(this.weeklyMarker);
-
-			this.weeklyGroup = document.createElement('div');
-			this.weeklyGroup.className = 'cc-usageGroup cc-usageGroup--weekly';
-			this.weeklyGroup.appendChild(this.weeklyBar);
-			this.weeklyGroup.appendChild(this.weeklyUsageSpan);
-			this.usageLine.appendChild(this.weeklyGroup);
-
-			this.overuseUsageSpan = document.createElement('span');
-			this.overuseUsageSpan.className = 'cc-usageText';
-
-			this.overuseBar = document.createElement('div');
-			this.overuseBar.className = 'cc-bar cc-bar--usage';
-			this.overuseBarFill = document.createElement('div');
-			this.overuseBarFill.className = 'cc-bar__fill';
-			this.overuseBar.appendChild(this.overuseBarFill);
-
-			this.overuseGroup = document.createElement('div');
-			this.overuseGroup.className = 'cc-usageGroup cc-usageGroup--overuse';
-			this.overuseGroup.appendChild(this.overuseBar);
-			this.overuseGroup.appendChild(this.overuseUsageSpan);
-			this.usageLine.appendChild(this.overuseGroup);
-
+			// No ml-auto here: the plan pill that follows is the sole right-anchor, so
+			// the indicator and the pill travel to the right edge as one unit whether
+			// or not the indicator is visible.
 			this.fiveHourIndicator = document.createElement('span');
-			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 ml-auto mr-3 whitespace-nowrap select-none flex-shrink-0';
+			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 whitespace-nowrap select-none flex-shrink-0';
 			this.fiveHourIndicator.textContent = '5-hour limit';
 			this.usageLine.appendChild(this.fiveHourIndicator);
+
+			// The only settings surface in the extension: click to override the
+			// detected plan. Mirrors the Gemini tier pill.
+			this.planButton = document.createElement('button');
+			this.planButton.type = 'button';
+			this.planButton.className = 'cc-planButton mr-3';
+			this.planButton.textContent = 'Plan';
+			this.usageLine.appendChild(this.planButton);
 
 			this.refreshProgressChrome();
 
@@ -317,6 +305,43 @@
 					this.refreshingUsage = false;
 				}
 			});
+
+			// The row itself is click-to-refresh, so the pill must not bubble.
+			this.planButton.addEventListener('click', (e) => {
+				e.stopPropagation();
+				e.preventDefault();
+				this.onPlanCycle?.();
+			});
+		}
+
+		/** @param {{plan: string, source: string}} planInfo */
+		setPlan(planInfo) {
+			this.plan = planInfo || null;
+			if (!this.planButton) return;
+			const plan = planInfo?.plan;
+			const name = CC.PLAN_NAMES?.[plan] || plan || '?';
+			// '· auto' distinguishes a detected plan from one the user pinned.
+			this.planButton.textContent = planInfo?.source === 'manual' ? name : `${name} · auto`;
+			this.planButton.title = planInfo?.source === 'manual'
+				? `Plan set manually to ${name}. Click to change.`
+				: `Plan detected as ${name}. Click to override.`;
+		}
+
+		/** Window keys this plan is expected to have; empty means "no opinion". */
+		_planWindowKeys() {
+			const spec = CC.PLAN_SPECS?.[this.plan?.plan];
+			return spec?.windows || [];
+		}
+
+		/**
+		 * Models to show on the new-chat screen. Only `free` narrows the list, so a
+		 * mis-detected plan can't silently drop bars.
+		 */
+		_planModelKeys() {
+			const all = CC.MODELS || ['haiku', 'sonnet', 'opus'];
+			if (this.plan?.plan !== 'free') return all;
+			const spec = CC.PLAN_SPECS?.free;
+			return all.filter((m) => spec?.models?.includes(m));
 		}
 
 		_setupTooltips() {
@@ -335,29 +360,34 @@
 				{ topOffset: 8 }
 			);
 
+			// The 5-hour budget is shared across models, so the per-model bars on the
+			// new-chat screen are a relative-burn-rate preview. Say so in the tooltip
+			// rather than letting the numbers imply three separate budgets.
 			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
 				const mg = this.modelGroups?.[m];
-				if (mg?.group) {
-					const name = CC.MODEL_NAMES?.[m] || m;
-					setupTooltip(
-						mg.group,
-						makeTooltip(`${name} 5-hour session window.\nThe bar shows your usage.\nThe line marks where you are in the window.`),
-						{ topOffset: 8 }
-					);
-				}
+				if (!mg?.group) continue;
+				const name = CC.MODEL_NAMES?.[m] || m;
+				const mult = CC.MODEL_USAGE_MULTIPLIERS?.[m] ?? 1;
+				const note = mult === 1
+					? 'This is your exact reported usage.'
+					: `Scaled ${mult < 1 ? `x1/${Math.round(1 / mult)}` : `x${mult}`} from the reported figure to reflect ${name}'s relative burn rate.`;
+				setupTooltip(
+					mg.group,
+					makeTooltip(`${name} - shared 5-hour session window.\n${note}\nThe line marks where you are in the window.`),
+					{ topOffset: 8 }
+				);
 			}
 
-			setupTooltip(
-				this.weeklyGroup,
-				makeTooltip("7-day usage window.\nThe bar shows your usage.\nThe line marks where you are in the window."),
-				{ topOffset: 8 }
-			);
-
-			setupTooltip(
-				this.overuseGroup,
-				makeTooltip("Overuse (extra usage) credits.\nThe bar shows your extra usage consumption beyond subscription limits."),
-				{ topOffset: 8 }
-			);
+			const windowTips = {
+				five_hour: '5-hour session window, exactly as reported by Claude.\nShared across all models.\nThe line marks where you are in the window.',
+				seven_day: '7-day usage window across all models.\nThe bar shows your usage.\nThe line marks where you are in the window.',
+				seven_day_opus: '7-day Opus usage window.\nOpus has its own weekly cap on Max plans.\nThe line marks where you are in the window.'
+			};
+			for (const win of (CC.WINDOWS || [])) {
+				const wg = this.windowGroups?.[win.key];
+				if (!wg?.group) continue;
+				setupTooltip(wg.group, makeTooltip(windowTips[win.key] || win.label), { topOffset: 8 });
+			}
 		}
 
 		attach() {
@@ -509,130 +539,116 @@
 			this.headerContainer.appendChild(this.headerDisplay);
 		}
 
-		setUsage(usage, { isNewChat = false, activeModel = 'sonnet' } = {}) {
+		/**
+		 * Paint one bar group from a normalized window ({utilization, resets_at,
+		 * window_hours}). Returns nothing; stores the derived window bounds on the
+		 * group so _updateMarkers and tick can reuse them.
+		 */
+		_paintGroup(group, win, label, { showReset = true, defaultHours = 5 } = {}) {
+			if (!group) return;
+			group.group.classList.remove('cc-hidden');
+
+			if (!win || typeof win.utilization !== 'number') {
+				group.usageSpan.textContent = `${label}: --`;
+				group.barFill.style.width = '0%';
+				group.barFill.classList.remove('cc-warn', 'cc-full');
+				group.resetMs = null;
+				group.windowStartMs = null;
+				return;
+			}
+
+			const rawPct = win.utilization;
+			group.resetMs = win.resets_at ? Date.parse(win.resets_at) : null;
+			if (!Number.isFinite(group.resetMs)) group.resetMs = null;
+			const windowHours = win.window_hours || defaultHours;
+			group.windowStartMs = group.resetMs ? group.resetMs - windowHours * 60 * 60 * 1000 : null;
+
+			const resetText = (showReset && group.resetMs) ? ` · resets in ${formatResetCountdown(group.resetMs)}` : '';
+			group.usageSpan.textContent = `${label}: ${Math.round(rawPct * 10) / 10}%${resetText}`;
+
+			const width = Math.max(0, Math.min(100, rawPct));
+			group.barFill.style.width = `${width}%`;
+			group.barFill.classList.toggle('cc-warn', width >= 90);
+			group.barFill.classList.toggle('cc-full', width >= 99.5);
+		}
+
+		_hideGroup(group) {
+			if (!group) return;
+			group.group.classList.add('cc-hidden');
+			group.resetMs = null;
+			group.windowStartMs = null;
+			group.barFill.classList.remove('cc-warn', 'cc-full');
+		}
+
+		setUsage(usage, { isNewChat = false, activeModel = 'sonnet', plan = null } = {}) {
 			this.isNewChat = !!isNewChat;
 			this.activeModel = activeModel;
+			if (plan) this.setPlan(plan);
 
 			this.refreshProgressChrome();
+
 			const modelsFiveHour = usage?.models_five_hour || {};
-			const fallbackFiveHour = usage?.five_hour || null;
-			const weekly = usage?.seven_day || null;
-			const overuse = usage?.overuse || null;
-
-			let fiveHourResetMs = null;
-			if (fallbackFiveHour?.resets_at) {
-				fiveHourResetMs = Date.parse(fallbackFiveHour.resets_at);
-			} else {
-				for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-					if (modelsFiveHour[m]?.resets_at) {
-						fiveHourResetMs = Date.parse(modelsFiveHour[m].resets_at);
-						break;
-					}
-				}
-			}
-			this.fiveHourResetMs = fiveHourResetMs;
-
-			if (this.fiveHourIndicator) {
-				this.fiveHourIndicator.style.display = isNewChat ? '' : 'none';
-				if (isNewChat) {
-					const resetText = fiveHourResetMs ? ` · resets in ${formatResetCountdown(fiveHourResetMs)}` : '';
-					this.fiveHourIndicator.textContent = `5h limit${resetText}`;
-				}
-			}
-
-			const hasAnyUsage = !!fallbackFiveHour || !!weekly || !!overuse || Object.keys(modelsFiveHour).length > 0;
+			const fiveHour = usage?.five_hour || null;
+			const hasAnyUsage = CC.WINDOWS.some((w) => !!usage?.[w.key]) || Object.keys(modelsFiveHour).length > 0;
 			this.usageLine?.classList.toggle('cc-hidden', !hasAnyUsage);
 
-			// 1. Model Session Bars (5-hour limit)
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (!mg) continue;
+			this.fiveHourResetMs = fiveHour?.resets_at ? Date.parse(fiveHour.resets_at) : null;
+			if (!Number.isFinite(this.fiveHourResetMs)) this.fiveHourResetMs = null;
 
-				const session = modelsFiveHour[m] || fallbackFiveHour;
-				const name = CC.MODEL_NAMES?.[m] || m;
-
-				if (isNewChat || m === activeModel) {
-					mg.group.classList.remove('cc-hidden');
-					const barWidth = isNewChat ? (CC.MODEL_WIDTHS?.[m] || '96px') : '200px';
+			if (isNewChat) {
+				// --- New-chat screen: multimodal preview of the shared 5h window ---
+				// Sonnet carries the exact reported figure; Haiku and Opus are scaled
+				// by their relative burn rate (CC.MODEL_USAGE_MULTIPLIERS).
+				const visibleModels = this._planModelKeys();
+				for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+					const mg = this.modelGroups?.[m];
+					if (!mg) continue;
+					if (!visibleModels.includes(m)) {
+						this._hideGroup(mg);
+						continue;
+					}
+					const barWidth = CC.MODEL_WIDTHS?.[m] || '96px';
 					mg.bar.style.width = barWidth;
 					mg.bar.style.flex = `0 0 ${barWidth}`;
-					if (session && typeof session.utilization === 'number') {
-						const rawPct = session.utilization;
-						const pct = Math.round(rawPct * 10) / 10;
-						mg.resetMs = session.resets_at ? Date.parse(session.resets_at) : null;
-						const windowHours = session.window_hours || 5;
-						mg.windowStartMs = mg.resetMs ? mg.resetMs - windowHours * 60 * 60 * 1000 : null;
-						const resetText = (!isNewChat && mg.resetMs) ? ` · resets in ${formatResetCountdown(mg.resetMs)}` : '';
-						mg.usageSpan.textContent = `${name}: ${pct}%${resetText}`;
+					// The shared countdown lives in the trailing indicator instead of
+					// being repeated on all three bars.
+					this._paintGroup(mg, modelsFiveHour[m] || fiveHour, CC.MODEL_NAMES?.[m] || m, { showReset: false });
+				}
 
-						const width = Math.max(0, Math.min(100, rawPct));
-						mg.barFill.style.width = `${width}%`;
-						mg.barFill.classList.toggle('cc-warn', width >= 90);
-						mg.barFill.classList.toggle('cc-full', width >= 99.5);
-					} else {
-						mg.usageSpan.textContent = `${name}: 0%`;
-						mg.barFill.style.width = '0%';
-						mg.barFill.classList.remove('cc-warn', 'cc-full');
-						mg.resetMs = null;
-						mg.windowStartMs = null;
+				// Weekly bars stay off the new-chat screen, as before.
+				for (const win of (CC.WINDOWS || [])) this._hideGroup(this.windowGroups?.[win.key]);
+
+				if (this.fiveHourIndicator) {
+					this.fiveHourIndicator.style.display = '';
+					const resetText = this.fiveHourResetMs ? ` · resets in ${formatResetCountdown(this.fiveHourResetMs)}` : '';
+					this.fiveHourIndicator.textContent = `5h limit${resetText}`;
+				}
+			} else {
+				// --- Inside a conversation: the real windows, no scaling ---
+				for (const mg of Object.values(this.modelGroups || {})) this._hideGroup(mg);
+
+				const planWindows = this._planWindowKeys();
+				for (const win of (CC.WINDOWS || [])) {
+					const wg = this.windowGroups?.[win.key];
+					if (!wg) continue;
+					const data = usage?.[win.key] || null;
+					// The API is authoritative: anything it returned is rendered even if
+					// the detected plan says this window shouldn't exist, so a wrong plan
+					// can never erase a real bar.
+					//
+					// The plan spec's only job is the reverse case: if usage came back but
+					// omitted a window this plan is supposed to have, show a '--'
+					// placeholder rather than silently nothing - that's a reporting gap
+					// the user should be able to see.
+					const expected = planWindows.includes(win.key);
+					if (!data && !(expected && hasAnyUsage)) {
+						this._hideGroup(wg);
+						continue;
 					}
-				} else {
-					mg.group.classList.add('cc-hidden');
+					this._paintGroup(wg, data, win.label, { defaultHours: win.hours });
 				}
-			}
 
-			// 2. Weekly Bar (7-day limit)
-			// Hidden on new chat site per requirement: "Show only 5 hour limit bars on the new chat site"
-			// Shown on existing conversation per requirement: "Once a model is choose and you remove all the other bars, make the weekly usage limit bar come back."
-			const hasWeekly = !isNewChat && weekly && typeof weekly.utilization === 'number';
-			this.weeklyGroup?.classList.toggle('cc-hidden', !hasWeekly);
-
-			if (hasWeekly) {
-				this.weeklyUsageSpan.classList.remove('cc-hidden');
-				this.weeklyBar.classList.remove('cc-hidden');
-				this.weeklyBar.style.width = '200px';
-				this.weeklyBar.style.flex = '0 0 200px';
-
-				const rawPct = weekly.utilization;
-				const pct = Math.round(rawPct * 10) / 10;
-				this.weeklyResetMs = weekly.resets_at ? Date.parse(weekly.resets_at) : null;
-				const weeklyHours = weekly.window_hours || (7 * 24);
-				this.weeklyWindowStartMs = this.weeklyResetMs ? this.weeklyResetMs - weeklyHours * 60 * 60 * 1000 : null;
-				const resetText = this.weeklyResetMs ? ` · resets in ${formatResetCountdown(this.weeklyResetMs)}` : '';
-				this.weeklyUsageSpan.textContent = `Weekly: ${pct}%${resetText}`;
-
-				const width = Math.max(0, Math.min(100, rawPct));
-				this.weeklyBarFill.style.width = `${width}%`;
-				this.weeklyBarFill.classList.toggle('cc-warn', width >= 90);
-				this.weeklyBarFill.classList.toggle('cc-full', width >= 99.5);
-			} else if (this.weeklyGroup) {
-				this.weeklyUsageSpan.classList.add('cc-hidden');
-				this.weeklyBar.classList.add('cc-hidden');
-				this.weeklyResetMs = null;
-				this.weeklyWindowStartMs = null;
-				this.weeklyBarFill.classList.remove('cc-warn', 'cc-full');
-			}
-
-			// 3. Overuse Credits Bar - removed per requirement
-			const hasOveruse = false;
-			this.overuseGroup?.classList.toggle('cc-hidden', true);
-
-			if (hasOveruse) {
-				let label = 'Overuse';
-				const pct = typeof overuse.utilization === 'number' ? Math.round(overuse.utilization * 10) / 10 : null;
-				if (typeof overuse.used === 'number' && typeof overuse.limit === 'number') {
-					label = `Overuse: $${overuse.used}/$${overuse.limit}${pct !== null ? ` (${pct}%)` : ''}`;
-				} else if (pct !== null) {
-					label = `Overuse: ${pct}%`;
-				} else if (typeof overuse.used === 'number') {
-					label = `Overuse: $${overuse.used}`;
-				}
-				this.overuseUsageSpan.textContent = label;
-
-				const width = Math.max(0, Math.min(100, overuse.utilization || 0));
-				this.overuseBarFill.style.width = `${width}%`;
-				this.overuseBarFill.classList.toggle('cc-warn', width >= 90);
-				this.overuseBarFill.classList.toggle('cc-full', width >= 99.5);
+				if (this.fiveHourIndicator) this.fiveHourIndicator.style.display = 'none';
 			}
 
 			this._updateMarkers();
@@ -641,31 +657,29 @@
 		_updateMarkers() {
 			const now = Date.now();
 
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (!mg) continue;
-				const shouldShowMarker = this.isNewChat ? (m === 'sonnet') : (m === this.activeModel);
-				if (shouldShowMarker && mg.marker && mg.windowStartMs && mg.resetMs) {
-					const total = mg.resetMs - mg.windowStartMs;
-					const elapsed = Math.max(0, Math.min(total, now - mg.windowStartMs));
-					const ratio = total > 0 ? elapsed / total : 0;
-					const pct = Math.max(0, Math.min(100, ratio * 100));
-					mg.marker.classList.remove('cc-hidden');
-					mg.marker.style.left = `${pct}%`;
-				} else if (mg.marker) {
-					mg.marker.classList.add('cc-hidden');
+			const place = (group, show) => {
+				if (!group?.marker) return;
+				if (!show || !group.windowStartMs || !group.resetMs) {
+					group.marker.classList.add('cc-hidden');
+					return;
 				}
+				const total = group.resetMs - group.windowStartMs;
+				const elapsed = Math.max(0, Math.min(total, now - group.windowStartMs));
+				const ratio = total > 0 ? elapsed / total : 0;
+				group.marker.classList.remove('cc-hidden');
+				group.marker.style.left = `${Math.max(0, Math.min(100, ratio * 100))}%`;
+			};
+
+			// New chat: one marker, on Sonnet - the three bars share one window, so
+			// three identical markers would just be noise.
+			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+				place(this.modelGroups?.[m], this.isNewChat && m === 'sonnet');
 			}
 
-			if (this.weeklyMarker && this.weeklyWindowStartMs && this.weeklyResetMs) {
-				const total = this.weeklyResetMs - this.weeklyWindowStartMs;
-				const elapsed = Math.max(0, Math.min(total, now - this.weeklyWindowStartMs));
-				const ratio = total > 0 ? elapsed / total : 0;
-				const pct = Math.max(0, Math.min(100, ratio * 100));
-				this.weeklyMarker.classList.remove('cc-hidden');
-				this.weeklyMarker.style.left = `${pct}%`;
-			} else if (this.weeklyMarker) {
-				this.weeklyMarker.classList.add('cc-hidden');
+			// In a conversation every visible window gets its own marker; they have
+			// genuinely different spans.
+			for (const win of (CC.WINDOWS || [])) {
+				place(this.windowGroups?.[win.key], !this.isNewChat);
 			}
 		}
 
@@ -685,24 +699,14 @@
 				this._renderHeader();
 			}
 
-			// Reset countdown text
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (mg?.resetMs && mg?.usageSpan?.textContent) {
-					const idx = mg.usageSpan.textContent.indexOf('· resets in');
-					if (idx !== -1) {
-						const prefix = mg.usageSpan.textContent.slice(0, idx + '· resets in '.length);
-						mg.usageSpan.textContent = `${prefix}${formatResetCountdown(mg.resetMs)}`;
-					}
-				}
-			}
-
-			if (this.weeklyResetMs && this.weeklyUsageSpan?.textContent) {
-				const idx = this.weeklyUsageSpan.textContent.indexOf('· resets in');
-				if (idx !== -1) {
-					const prefix = this.weeklyUsageSpan.textContent.slice(0, idx + '· resets in '.length);
-					this.weeklyUsageSpan.textContent = `${prefix}${formatResetCountdown(this.weeklyResetMs)}`;
-				}
+			// Reset countdown text. Patched in place rather than re-rendered.
+			const groups = [...Object.values(this.modelGroups || {}), ...Object.values(this.windowGroups || {})];
+			for (const group of groups) {
+				if (!group?.resetMs || !group?.usageSpan?.textContent) continue;
+				const idx = group.usageSpan.textContent.indexOf('· resets in');
+				if (idx === -1) continue;
+				const prefix = group.usageSpan.textContent.slice(0, idx + '· resets in '.length);
+				group.usageSpan.textContent = `${prefix}${formatResetCountdown(group.resetMs)}`;
 			}
 
 			if (this.isNewChat && this.fiveHourResetMs && this.fiveHourIndicator?.textContent) {

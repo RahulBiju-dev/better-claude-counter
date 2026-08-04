@@ -10,6 +10,81 @@
 // @require      https://unpkg.com/gpt-tokenizer@2.9.0/dist/o200k_base.js
 // ==/UserScript==
 
+// --- src/shared/store.js ---------------------------------------------------
+// Shared by both site modules, so deliberately not behind a hostname guard.
+(() => {
+	'use strict';
+	if (globalThis.CCStore) return;
+
+	function getStorageArea() {
+		try {
+			return globalThis.browser?.storage?.local || globalThis.chrome?.storage?.local || null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
+	 * chrome.storage.local when running as an extension, localStorage otherwise
+	 * (this userscript build has no extension APIs). Both are local-only.
+	 */
+	globalThis.CCStore = {
+		async get(key) {
+			const area = getStorageArea();
+			if (area) {
+				try {
+					const result = await new Promise((resolve, reject) => {
+						const maybePromise = area.get(key, (items) => {
+							const err = globalThis.chrome?.runtime?.lastError;
+							if (err) reject(new Error(err.message));
+							else resolve(items);
+						});
+						// Firefox returns a promise instead of using the callback.
+						if (maybePromise && typeof maybePromise.then === 'function') {
+							maybePromise.then(resolve, reject);
+						}
+					});
+					return result?.[key] ?? null;
+				} catch {
+					// fall through to localStorage
+				}
+			}
+			try {
+				const raw = localStorage.getItem(key);
+				return raw ? JSON.parse(raw) : null;
+			} catch {
+				return null;
+			}
+		},
+
+		async set(key, value) {
+			const area = getStorageArea();
+			if (area) {
+				try {
+					await new Promise((resolve, reject) => {
+						const maybePromise = area.set({ [key]: value }, () => {
+							const err = globalThis.chrome?.runtime?.lastError;
+							if (err) reject(new Error(err.message));
+							else resolve();
+						});
+						if (maybePromise && typeof maybePromise.then === 'function') {
+							maybePromise.then(resolve, reject);
+						}
+					});
+					return;
+				} catch {
+					// fall through to localStorage
+				}
+			}
+			try {
+				localStorage.setItem(key, JSON.stringify(value));
+			} catch {
+				// storage full or blocked; callers degrade to in-memory
+			}
+		}
+	};
+})();
+
 (() => {
 	'use strict';
 	if (location.hostname !== 'claude.ai') return;
@@ -20,6 +95,7 @@
 
 	CC._ccInternal = CC._ccInternal || {};
 	CC._ccInternal.onGenerationStart = CC._ccInternal.onGenerationStart || (() => {});
+	CC._ccInternal.onGenerationEnd = CC._ccInternal.onGenerationEnd || (() => {});
 	CC._ccInternal.onConversationData = CC._ccInternal.onConversationData || (() => {});
 	CC._ccInternal.onMessageLimit = CC._ccInternal.onMessageLimit || (() => {});
 	CC._ccInternal.onUrlChange = CC._ccInternal.onUrlChange || (() => {});
@@ -109,10 +185,12 @@
 	}
 
 	async function handleEventStream(response) {
+		let started = false;
 		try {
 			const cloned = response.clone();
 			const reader = cloned.body?.getReader?.();
 			if (!reader) return;
+			started = true;
 			const decoder = new TextDecoder();
 			let buffer = '';
 
@@ -139,6 +217,17 @@
 			}
 		} catch {
 			// best-effort; do not break claude.ai
+		} finally {
+			// The stream ending is the reliable "a message just completed" signal.
+			// message_limit only rides along on some completions, so this is what
+			// drives the post-generation /usage re-fetch.
+			if (started) {
+				try {
+					CC._ccInternal.onGenerationEnd();
+				} catch {
+					// ignore
+				}
+			}
 		}
 	}
 })();
@@ -158,7 +247,26 @@
 
 	CC.CONST = Object.freeze({
 		CACHE_WINDOW_MS: 5 * 60 * 1000,
-		CONTEXT_LIMIT_TOKENS: 200000
+		CONTEXT_LIMIT_TOKENS: 200000,
+
+		// --- Usage freshness ---
+		// The SSE `message_limit` event only arrives on some completions, so it can
+		// never be the only in-session update path or the bars freeze mid-session.
+		// Everything below exists to keep /usage the authoritative, current number.
+		//
+		// Periodic re-fetch while the tab is visible.
+		USAGE_REFRESH_MS: 5 * 60 * 1000,
+		// Hard floor between /usage requests, whatever asks for one. Deliberately
+		// smaller than the gap between POST_GENERATION_DELAYS_MS so both of those
+		// checks still land - it exists to coalesce simultaneous triggers (the SSE
+		// message_limit and the stream ending fire together), not to throttle them.
+		USAGE_MIN_INTERVAL_MS: 3 * 1000,
+		// The server's counter lags the end of the stream, so re-check twice.
+		POST_GENERATION_DELAYS_MS: Object.freeze([1500, 8000]),
+		// On becoming visible again, only re-fetch if the data is at least this old.
+		USAGE_STALE_ON_VISIBLE_MS: 60 * 1000,
+
+		PLAN_STORAGE_KEY: 'cc:plan:v1'
 	});
 
 	CC.COLORS = Object.freeze({
@@ -188,13 +296,362 @@
 		opus: '96px'
 	});
 
+	/**
+	 * New-chat screen only.
+	 *
+	 * Anthropic's /usage reports ONE shared five_hour utilization for all models,
+	 * so a true per-model split does not exist. On the new-chat screen we still
+	 * want a multimodal at-a-glance preview, so Sonnet shows the real number and
+	 * Haiku/Opus are scaled by their relative burn rate. This is a deliberate
+	 * approximation, not a bug - do not "fix" it.
+	 *
+	 * Inside a conversation these are NOT applied: the row switches to a single
+	 * unscaled 5h bar (see CC.WINDOWS) so the number on screen is exactly the
+	 * number the API returned.
+	 */
 	CC.MODEL_USAGE_MULTIPLIERS = Object.freeze({
 		haiku: 1 / 3,
 		sonnet: 1.0,
 		opus: 2.0
 	});
+
+	/**
+	 * The real rate-limit windows, as returned by /usage. Rendered inside a
+	 * conversation, one bar each, every value straight from the API.
+	 */
+	CC.WINDOWS = Object.freeze([
+		Object.freeze({ key: 'five_hour', label: '5h', hours: 5 }),
+		Object.freeze({ key: 'seven_day', label: 'Weekly', hours: 7 * 24 }),
+		Object.freeze({ key: 'seven_day_opus', label: 'Weekly Opus', hours: 7 * 24 })
+	]);
+
+	CC.WINDOW_WIDTHS = Object.freeze({
+		five_hour: '200px',
+		seven_day: '200px',
+		seven_day_opus: '200px'
+	});
+
+	// 'auto' is not a plan; it is the sentinel meaning "use whatever we detected".
+	CC.PLAN_AUTO = 'auto';
+
+	CC.PLANS = Object.freeze(['free', 'pro', 'max5', 'max20', 'team', 'enterprise']);
+
+	CC.PLAN_NAMES = Object.freeze({
+		free: 'Free',
+		pro: 'Pro',
+		max5: 'Max 5x',
+		max20: 'Max 20x',
+		team: 'Team',
+		enterprise: 'Enterprise'
+	});
+
+	CC.DEFAULT_PLAN = 'pro';
+
+	/**
+	 * Which bars a plan has.
+	 *   windows - rate-limit windows shown inside a conversation.
+	 *   models  - model bars shown on the new-chat screen.
+	 *
+	 * This only ever *fills gaps*. A window the API actually returned is always
+	 * rendered even if the spec says the plan shouldn't have it, so a wrong plan
+	 * can't erase a real bar. Likewise only `free` narrows the model list.
+	 */
+	CC.PLAN_SPECS = Object.freeze({
+		free: Object.freeze({
+			windows: Object.freeze(['five_hour']),
+			models: Object.freeze(['sonnet'])
+		}),
+		pro: Object.freeze({
+			windows: Object.freeze(['five_hour', 'seven_day']),
+			models: Object.freeze(['haiku', 'sonnet', 'opus'])
+		}),
+		max5: Object.freeze({
+			windows: Object.freeze(['five_hour', 'seven_day', 'seven_day_opus']),
+			models: Object.freeze(['haiku', 'sonnet', 'opus'])
+		}),
+		max20: Object.freeze({
+			windows: Object.freeze(['five_hour', 'seven_day', 'seven_day_opus']),
+			models: Object.freeze(['haiku', 'sonnet', 'opus'])
+		}),
+		team: Object.freeze({
+			windows: Object.freeze(['five_hour', 'seven_day']),
+			models: Object.freeze(['haiku', 'sonnet', 'opus'])
+		}),
+		enterprise: Object.freeze({
+			windows: Object.freeze(['five_hour', 'seven_day']),
+			models: Object.freeze(['haiku', 'sonnet', 'opus'])
+		})
+	});
 })();
 
+
+// --- src/content/plan.js ---------------------------------------------------
+// Same logic as the extension build; the only difference is that the account
+// endpoints are fetched directly here instead of through the injected bridge.
+(() => {
+	'use strict';
+	if (location.hostname !== 'claude.ai') return;
+
+	const CC = (globalThis.ClaudeCounter = globalThis.ClaudeCounter || {});
+
+	const store = globalThis.CCStore;
+
+	function debugEnabled() {
+		try {
+			return localStorage.getItem('cc:debug') === '1';
+		} catch {
+			return false;
+		}
+	}
+
+	function debug(...args) {
+		if (debugEnabled()) console.log('[cc:plan]', ...args);
+	}
+
+	/**
+	 * Anthropic's tier strings are not documented and have changed shape before
+	 * (`default_pro`, `claude_max_20x`, ...), so match loosely and order the tests
+	 * most-specific first. Unknown strings return null rather than guessing.
+	 */
+	function planFromTierString(raw) {
+		if (typeof raw !== 'string' || !raw) return null;
+		const s = raw.toLowerCase();
+		if (/enterprise/.test(s)) return 'enterprise';
+		if (/team/.test(s)) return 'team';
+		if (/(max.*20|20\s*x|max_20)/.test(s)) return 'max20';
+		if (/(max.*5|5\s*x|max_5)/.test(s)) return 'max5';
+		if (/max/.test(s)) return 'max5';
+		if (/pro/.test(s)) return 'pro';
+		if (/free/.test(s)) return 'free';
+		return null;
+	}
+
+	function planFromCapabilities(caps) {
+		if (!Array.isArray(caps)) return null;
+		const joined = caps.filter((c) => typeof c === 'string').join(',').toLowerCase();
+		if (!joined) return null;
+		if (/enterprise/.test(joined)) return 'enterprise';
+		if (/team/.test(joined)) return 'team';
+		// Capabilities carry no 5x/20x distinction; max5 is the conservative read.
+		if (/claude_max|\bmax\b/.test(joined)) return 'max5';
+		if (/claude_pro|\bpro\b/.test(joined)) return 'pro';
+		// A logged-in org that advertises chat but neither pro nor max is free.
+		if (/chat/.test(joined)) return 'free';
+		return null;
+	}
+
+	function collectOrgs(account) {
+		const orgs = [];
+		const push = (o) => {
+			if (o && typeof o === 'object') orgs.push(o);
+		};
+
+		const organizations = account?.organizations;
+		if (Array.isArray(organizations)) organizations.forEach(push);
+
+		const bootstrap = account?.bootstrap;
+		if (bootstrap && typeof bootstrap === 'object') {
+			push(bootstrap.organization);
+			push(bootstrap.account?.organization);
+			const memberships = bootstrap.account?.memberships || bootstrap.memberships;
+			if (Array.isArray(memberships)) {
+				for (const m of memberships) push(m?.organization);
+			}
+		}
+
+		return orgs;
+	}
+
+	function pickOrg(orgs, orgId) {
+		if (!orgs.length) return null;
+		if (orgId) {
+			const match = orgs.find((o) => o?.uuid === orgId || o?.id === orgId);
+			if (match) return match;
+		}
+		return orgs[0];
+	}
+
+	function planFromOrg(org) {
+		if (!org || typeof org !== 'object') return null;
+
+		const tierCandidates = [
+			org.rate_limit_tier,
+			org.settings?.rate_limit_tier,
+			org.billing_type,
+			org.subscription_tier,
+			org.plan,
+			org.plan_type,
+			org.tier
+		];
+		for (const cand of tierCandidates) {
+			const p = planFromTierString(cand);
+			if (p) {
+				debug('plan from tier string', cand, '->', p);
+				return p;
+			}
+		}
+
+		const p = planFromCapabilities(org.capabilities);
+		if (p) debug('plan from capabilities', org.capabilities, '->', p);
+		return p;
+	}
+
+	function planFromUsageShape(raw) {
+		if (!raw || typeof raw !== 'object') return null;
+		const hasOpusWeek = !!(raw.seven_day_opus || raw.seven_day?.opus);
+		const hasWeek = !!raw.seven_day;
+		const hasFiveHour = !!raw.five_hour;
+
+		// A separate weekly Opus window only exists on the Max tiers.
+		if (hasOpusWeek) return 'max5';
+		// A 5-hour window with no weekly window at all is the Free shape.
+		if (hasFiveHour && !hasWeek) return 'free';
+		return null;
+	}
+
+	/** Last resort: the account menu usually names the plan in plain text. */
+	function planFromDom() {
+		let text = '';
+		try {
+			const candidates = document.querySelectorAll(
+				'[data-testid="user-menu-button"], [aria-label*="profile" i], [aria-label*="account" i], nav button'
+			);
+			for (const el of candidates) {
+				text += ` ${el.textContent || ''}`;
+			}
+		} catch {
+			return null;
+		}
+		if (!text.trim()) return null;
+		const s = text.toLowerCase();
+		if (/max\s*20/.test(s)) return 'max20';
+		if (/max\s*5/.test(s)) return 'max5';
+		if (/\bmax\b/.test(s)) return 'max5';
+		if (/\bpro\b/.test(s)) return 'pro';
+		return null;
+	}
+
+	async function fetchAccount() {
+		const originalFetch = CC._ccInternal?.originalFetch || (window.fetch ? window.fetch.bind(window) : null);
+		if (!originalFetch) return null;
+
+		// Fetched independently so one 404 doesn't sink the other.
+		const getJson = async (url) => {
+			try {
+				const res = await originalFetch(url, { method: 'GET', credentials: 'include' });
+				if (!res.ok) return null;
+				return await res.json();
+			} catch {
+				return null;
+			}
+		};
+
+		const [bootstrap, organizations] = await Promise.all([
+			getJson('https://claude.ai/api/bootstrap'),
+			getJson('https://claude.ai/api/organizations')
+		]);
+		return { bootstrap, organizations };
+	}
+
+	class PlanResolver {
+		constructor() {
+			this.override = null; // a CC.PLANS entry, or null for auto
+			this.detected = null; // last successful auto-detection
+			this.loaded = false;
+			this._saveTimer = null;
+		}
+
+		async load() {
+			try {
+				const raw = await store?.get(CC.CONST.PLAN_STORAGE_KEY);
+				if (raw && typeof raw === 'object') {
+					if (CC.PLANS.includes(raw.override)) this.override = raw.override;
+					if (CC.PLANS.includes(raw.detected)) this.detected = raw.detected;
+				}
+			} catch {
+				// storage unavailable; stay on defaults
+			}
+			this.loaded = true;
+			return this.get();
+		}
+
+		_scheduleSave() {
+			if (this._saveTimer) clearTimeout(this._saveTimer);
+			this._saveTimer = setTimeout(() => {
+				this._saveTimer = null;
+				store?.set(CC.CONST.PLAN_STORAGE_KEY, {
+					override: this.override,
+					detected: this.detected
+				});
+			}, 250);
+		}
+
+		/** @returns {{plan: string, source: 'manual'|'auto'|'default', detected: string|null}} */
+		get() {
+			if (this.override) return { plan: this.override, source: 'manual', detected: this.detected };
+			if (this.detected) return { plan: this.detected, source: 'auto', detected: this.detected };
+			return { plan: CC.DEFAULT_PLAN, source: 'default', detected: null };
+		}
+
+		spec() {
+			return CC.PLAN_SPECS[this.get().plan] || CC.PLAN_SPECS[CC.DEFAULT_PLAN];
+		}
+
+		setOverride(plan) {
+			this.override = CC.PLANS.includes(plan) ? plan : null;
+			this._scheduleSave();
+			return this.get();
+		}
+
+		/** Cycle auto -> free -> pro -> max5 -> max20 -> team -> enterprise -> auto. */
+		cycle() {
+			const order = [CC.PLAN_AUTO, ...CC.PLANS];
+			const current = this.override || CC.PLAN_AUTO;
+			const next = order[(order.indexOf(current) + 1) % order.length];
+			return this.setOverride(next === CC.PLAN_AUTO ? null : next);
+		}
+
+		_setDetected(plan) {
+			if (!plan || plan === this.detected) return false;
+			this.detected = plan;
+			this._scheduleSave();
+			debug('detected plan ->', plan);
+			return true;
+		}
+
+		async detect({ orgId } = {}) {
+			let account = null;
+			try {
+				account = await fetchAccount();
+			} catch (e) {
+				debug('account fetch failed', e?.message || e);
+				return false;
+			}
+			if (debugEnabled()) debug('raw account payload', account);
+
+			const org = pickOrg(collectOrgs(account), orgId);
+			if (debugEnabled()) debug('selected org', org);
+
+			return this._setDetected(planFromOrg(org) || planFromDom());
+		}
+
+		observeUsageShape(raw) {
+			if (debugEnabled()) debug('raw usage payload', raw);
+			const shape = planFromUsageShape(raw);
+			if (!shape) return false;
+
+			// The shape read can't tell 5x from 20x, so don't clobber a detected 20x.
+			if (shape === 'max5' && this.detected === 'max20') return false;
+			// Nor should it demote a named tier to free on a transient partial response.
+			if (shape === 'free' && this.detected && this.detected !== 'free') return false;
+
+			return this._setDetected(shape);
+		}
+	}
+
+	CC.plan = new PlanResolver();
+	CC.planHelpers = { planFromTierString, planFromCapabilities, planFromUsageShape };
+})();
 
 
 (() => {
@@ -512,8 +969,9 @@
 	}
 
 	class CounterUI {
-		constructor({ onUsageRefresh } = {}) {
+		constructor({ onUsageRefresh, onPlanCycle } = {}) {
 			this.onUsageRefresh = onUsageRefresh || null;
+			this.onPlanCycle = onPlanCycle || null;
 
 			this.headerContainer = null;
 			this.headerDisplay = null;
@@ -526,19 +984,14 @@
 			this.pendingCache = false;
 
 			this.usageLine = null;
+			// New-chat screen: the scaled multimodal preview (Sonnet exact, others
+			// scaled by CC.MODEL_USAGE_MULTIPLIERS).
 			this.modelGroups = {};
-			this.weeklyGroup = null;
-			this.weeklyUsageSpan = null;
-			this.weeklyBar = null;
-			this.weeklyBarFill = null;
-			this.weeklyMarker = null;
-			this.weeklyResetMs = null;
-			this.weeklyWindowStartMs = null;
-			this.overuseGroup = null;
-			this.overuseUsageSpan = null;
-			this.overuseBar = null;
-			this.overuseBarFill = null;
+			// Inside a conversation: the real rate-limit windows, unscaled.
+			this.windowGroups = {};
 			this.fiveHourIndicator = null;
+			this.planButton = null;
+			this.plan = null;
 			this.isNewChat = false;
 			this.activeModel = 'sonnet';
 			this.refreshingUsage = false;
@@ -572,13 +1025,12 @@
 			};
 
 			applyBarChrome(this.lengthBar, { fillWarn: fillColor });
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				if (this.modelGroups?.[m]?.bar) {
-					applyBarChrome(this.modelGroups[m].bar, { fillWarn: CC.COLORS.RED_WARNING });
-				}
+			for (const group of [...Object.values(this.modelGroups || {}), ...Object.values(this.windowGroups || {})]) {
+				applyBarChrome(group?.bar, { fillWarn: CC.COLORS.RED_WARNING });
 			}
-			applyBarChrome(this.weeklyBar, { fillWarn: CC.COLORS.RED_WARNING });
-			applyBarChrome(this.overuseBar, { fillWarn: CC.COLORS.RED_WARNING });
+			if (this.planButton) {
+				this.planButton.style.setProperty('--cc-stroke', strokeColor);
+			}
 		}
 
 		initialize() {
@@ -644,16 +1096,17 @@
 			this.usageLine.className =
 				'text-text-400 text-[11px] cc-usageRow cc-hidden flex flex-row items-center gap-4 w-full flex-nowrap';
 
-			this.modelGroups = {};
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+			// A bar group: label + track + fill + window-progress marker. Used for
+			// both the new-chat model preview and the in-conversation windows, which
+			// differ only in label, width and whether the value is scaled.
+			const buildGroup = ({ modifier, width, labelFirst = true }) => {
 				const usageSpan = document.createElement('span');
 				usageSpan.className = 'cc-usageText';
 
 				const bar = document.createElement('div');
 				bar.className = 'cc-bar cc-bar--usage';
-				const widthPct = CC.MODEL_WIDTHS?.[m] || '15%';
-				bar.style.width = widthPct;
-				bar.style.flex = `0 0 ${widthPct}`;
+				bar.style.width = width;
+				bar.style.flex = `0 0 ${width}`;
 
 				const barFill = document.createElement('div');
 				barFill.className = 'cc-bar__fill';
@@ -664,60 +1117,52 @@
 				bar.appendChild(marker);
 
 				const group = document.createElement('div');
-				group.className = 'cc-usageGroup cc-usageGroup--model';
-				group.appendChild(usageSpan);
-				group.appendChild(bar);
+				group.className = `cc-usageGroup ${modifier}`;
+				if (labelFirst) {
+					group.appendChild(usageSpan);
+					group.appendChild(bar);
+				} else {
+					group.appendChild(bar);
+					group.appendChild(usageSpan);
+				}
 
-				this.modelGroups[m] = {
-					group,
-					usageSpan,
-					bar,
-					barFill,
-					marker,
-					resetMs: null,
-					windowStartMs: null
-				};
 				this.usageLine.appendChild(group);
+				return { group, usageSpan, bar, barFill, marker, resetMs: null, windowStartMs: null };
+			};
+
+			this.modelGroups = {};
+			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+				this.modelGroups[m] = buildGroup({
+					modifier: 'cc-usageGroup--model',
+					width: CC.MODEL_WIDTHS?.[m] || '96px'
+				});
 			}
 
-			this.weeklyUsageSpan = document.createElement('span');
-			this.weeklyUsageSpan.className = 'cc-usageText';
+			this.windowGroups = {};
+			for (const win of (CC.WINDOWS || [])) {
+				this.windowGroups[win.key] = buildGroup({
+					modifier: `cc-usageGroup--window cc-usageGroup--${win.key}`,
+					width: CC.WINDOW_WIDTHS?.[win.key] || '200px',
+					// Weekly bars read bar-then-label, matching the previous layout.
+					labelFirst: win.key === 'five_hour'
+				});
+			}
 
-			this.weeklyBar = document.createElement('div');
-			this.weeklyBar.className = 'cc-bar cc-bar--usage';
-			this.weeklyBarFill = document.createElement('div');
-			this.weeklyBarFill.className = 'cc-bar__fill';
-			this.weeklyMarker = document.createElement('div');
-			this.weeklyMarker.className = 'cc-bar__marker cc-hidden';
-			this.weeklyMarker.style.left = '0%';
-			this.weeklyBar.appendChild(this.weeklyBarFill);
-			this.weeklyBar.appendChild(this.weeklyMarker);
-
-			this.weeklyGroup = document.createElement('div');
-			this.weeklyGroup.className = 'cc-usageGroup cc-usageGroup--weekly';
-			this.weeklyGroup.appendChild(this.weeklyBar);
-			this.weeklyGroup.appendChild(this.weeklyUsageSpan);
-			this.usageLine.appendChild(this.weeklyGroup);
-
-			this.overuseUsageSpan = document.createElement('span');
-			this.overuseUsageSpan.className = 'cc-usageText';
-
-			this.overuseBar = document.createElement('div');
-			this.overuseBar.className = 'cc-bar cc-bar--usage';
-			this.overuseBarFill = document.createElement('div');
-			this.overuseBarFill.className = 'cc-bar__fill';
-			this.overuseBar.appendChild(this.overuseBarFill);
-
-			this.overuseGroup = document.createElement('div');
-			this.overuseGroup.className = 'cc-usageGroup cc-usageGroup--overuse';
-			this.overuseGroup.appendChild(this.overuseBar);
-			this.overuseGroup.appendChild(this.overuseUsageSpan);
-			this.usageLine.appendChild(this.overuseGroup);
-
+			// No ml-auto here: the plan pill that follows is the sole right-anchor, so
+			// the indicator and the pill travel to the right edge as one unit whether
+			// or not the indicator is visible.
 			this.fiveHourIndicator = document.createElement('span');
-			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 ml-auto mr-3 whitespace-nowrap select-none flex-shrink-0';
+			this.fiveHourIndicator.className = 'cc-usageText text-text-500 opacity-75 whitespace-nowrap select-none flex-shrink-0';
 			this.fiveHourIndicator.textContent = '5-hour limit';
 			this.usageLine.appendChild(this.fiveHourIndicator);
+
+			// The only settings surface in the extension: click to override the
+			// detected plan. Mirrors the Gemini tier pill.
+			this.planButton = document.createElement('button');
+			this.planButton.type = 'button';
+			this.planButton.className = 'cc-planButton mr-3';
+			this.planButton.textContent = 'Plan';
+			this.usageLine.appendChild(this.planButton);
 
 			this.refreshProgressChrome();
 
@@ -732,6 +1177,43 @@
 					this.refreshingUsage = false;
 				}
 			});
+
+			// The row itself is click-to-refresh, so the pill must not bubble.
+			this.planButton.addEventListener('click', (e) => {
+				e.stopPropagation();
+				e.preventDefault();
+				this.onPlanCycle?.();
+			});
+		}
+
+		/** @param {{plan: string, source: string}} planInfo */
+		setPlan(planInfo) {
+			this.plan = planInfo || null;
+			if (!this.planButton) return;
+			const plan = planInfo?.plan;
+			const name = CC.PLAN_NAMES?.[plan] || plan || '?';
+			// '· auto' distinguishes a detected plan from one the user pinned.
+			this.planButton.textContent = planInfo?.source === 'manual' ? name : `${name} · auto`;
+			this.planButton.title = planInfo?.source === 'manual'
+				? `Plan set manually to ${name}. Click to change.`
+				: `Plan detected as ${name}. Click to override.`;
+		}
+
+		/** Window keys this plan is expected to have; empty means "no opinion". */
+		_planWindowKeys() {
+			const spec = CC.PLAN_SPECS?.[this.plan?.plan];
+			return spec?.windows || [];
+		}
+
+		/**
+		 * Models to show on the new-chat screen. Only `free` narrows the list, so a
+		 * mis-detected plan can't silently drop bars.
+		 */
+		_planModelKeys() {
+			const all = CC.MODELS || ['haiku', 'sonnet', 'opus'];
+			if (this.plan?.plan !== 'free') return all;
+			const spec = CC.PLAN_SPECS?.free;
+			return all.filter((m) => spec?.models?.includes(m));
 		}
 
 		_setupTooltips() {
@@ -750,29 +1232,34 @@
 				{ topOffset: 8 }
 			);
 
+			// The 5-hour budget is shared across models, so the per-model bars on the
+			// new-chat screen are a relative-burn-rate preview. Say so in the tooltip
+			// rather than letting the numbers imply three separate budgets.
 			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
 				const mg = this.modelGroups?.[m];
-				if (mg?.group) {
-					const name = CC.MODEL_NAMES?.[m] || m;
-					setupTooltip(
-						mg.group,
-						makeTooltip(`${name} 5-hour session window.\nThe bar shows your usage.\nThe line marks where you are in the window.`),
-						{ topOffset: 8 }
-					);
-				}
+				if (!mg?.group) continue;
+				const name = CC.MODEL_NAMES?.[m] || m;
+				const mult = CC.MODEL_USAGE_MULTIPLIERS?.[m] ?? 1;
+				const note = mult === 1
+					? 'This is your exact reported usage.'
+					: `Scaled ${mult < 1 ? `x1/${Math.round(1 / mult)}` : `x${mult}`} from the reported figure to reflect ${name}'s relative burn rate.`;
+				setupTooltip(
+					mg.group,
+					makeTooltip(`${name} - shared 5-hour session window.\n${note}\nThe line marks where you are in the window.`),
+					{ topOffset: 8 }
+				);
 			}
 
-			setupTooltip(
-				this.weeklyGroup,
-				makeTooltip("7-day usage window.\nThe bar shows your usage.\nThe line marks where you are in the window."),
-				{ topOffset: 8 }
-			);
-
-			setupTooltip(
-				this.overuseGroup,
-				makeTooltip("Overuse (extra usage) credits.\nThe bar shows your extra usage consumption beyond subscription limits."),
-				{ topOffset: 8 }
-			);
+			const windowTips = {
+				five_hour: '5-hour session window, exactly as reported by Claude.\nShared across all models.\nThe line marks where you are in the window.',
+				seven_day: '7-day usage window across all models.\nThe bar shows your usage.\nThe line marks where you are in the window.',
+				seven_day_opus: '7-day Opus usage window.\nOpus has its own weekly cap on Max plans.\nThe line marks where you are in the window.'
+			};
+			for (const win of (CC.WINDOWS || [])) {
+				const wg = this.windowGroups?.[win.key];
+				if (!wg?.group) continue;
+				setupTooltip(wg.group, makeTooltip(windowTips[win.key] || win.label), { topOffset: 8 });
+			}
 		}
 
 		attach() {
@@ -924,128 +1411,116 @@
 			this.headerContainer.appendChild(this.headerDisplay);
 		}
 
-		setUsage(usage, { isNewChat = false, activeModel = 'sonnet' } = {}) {
+		/**
+		 * Paint one bar group from a normalized window ({utilization, resets_at,
+		 * window_hours}). Returns nothing; stores the derived window bounds on the
+		 * group so _updateMarkers and tick can reuse them.
+		 */
+		_paintGroup(group, win, label, { showReset = true, defaultHours = 5 } = {}) {
+			if (!group) return;
+			group.group.classList.remove('cc-hidden');
+
+			if (!win || typeof win.utilization !== 'number') {
+				group.usageSpan.textContent = `${label}: --`;
+				group.barFill.style.width = '0%';
+				group.barFill.classList.remove('cc-warn', 'cc-full');
+				group.resetMs = null;
+				group.windowStartMs = null;
+				return;
+			}
+
+			const rawPct = win.utilization;
+			group.resetMs = win.resets_at ? Date.parse(win.resets_at) : null;
+			if (!Number.isFinite(group.resetMs)) group.resetMs = null;
+			const windowHours = win.window_hours || defaultHours;
+			group.windowStartMs = group.resetMs ? group.resetMs - windowHours * 60 * 60 * 1000 : null;
+
+			const resetText = (showReset && group.resetMs) ? ` · resets in ${formatResetCountdown(group.resetMs)}` : '';
+			group.usageSpan.textContent = `${label}: ${Math.round(rawPct * 10) / 10}%${resetText}`;
+
+			const width = Math.max(0, Math.min(100, rawPct));
+			group.barFill.style.width = `${width}%`;
+			group.barFill.classList.toggle('cc-warn', width >= 90);
+			group.barFill.classList.toggle('cc-full', width >= 99.5);
+		}
+
+		_hideGroup(group) {
+			if (!group) return;
+			group.group.classList.add('cc-hidden');
+			group.resetMs = null;
+			group.windowStartMs = null;
+			group.barFill.classList.remove('cc-warn', 'cc-full');
+		}
+
+		setUsage(usage, { isNewChat = false, activeModel = 'sonnet', plan = null } = {}) {
 			this.isNewChat = !!isNewChat;
 			this.activeModel = activeModel;
+			if (plan) this.setPlan(plan);
 
 			this.refreshProgressChrome();
+
 			const modelsFiveHour = usage?.models_five_hour || {};
-			const fallbackFiveHour = usage?.five_hour || null;
-			const weekly = usage?.seven_day || null;
-			const overuse = usage?.overuse || null;
-
-			let fiveHourResetMs = null;
-			if (fallbackFiveHour?.resets_at) {
-				fiveHourResetMs = Date.parse(fallbackFiveHour.resets_at);
-			} else {
-				for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-					if (modelsFiveHour[m]?.resets_at) {
-						fiveHourResetMs = Date.parse(modelsFiveHour[m].resets_at);
-						break;
-					}
-				}
-			}
-			this.fiveHourResetMs = fiveHourResetMs;
-
-			if (this.fiveHourIndicator) {
-				this.fiveHourIndicator.style.display = isNewChat ? '' : 'none';
-				if (isNewChat) {
-					const resetText = fiveHourResetMs ? ` · resets in ${formatResetCountdown(fiveHourResetMs)}` : '';
-					this.fiveHourIndicator.textContent = `5h limit${resetText}`;
-				}
-			}
-
-			const hasAnyUsage = !!fallbackFiveHour || !!weekly || !!overuse || Object.keys(modelsFiveHour).length > 0;
+			const fiveHour = usage?.five_hour || null;
+			const hasAnyUsage = CC.WINDOWS.some((w) => !!usage?.[w.key]) || Object.keys(modelsFiveHour).length > 0;
 			this.usageLine?.classList.toggle('cc-hidden', !hasAnyUsage);
 
-			// 1. Model Session Bars (5-hour limit)
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (!mg) continue;
+			this.fiveHourResetMs = fiveHour?.resets_at ? Date.parse(fiveHour.resets_at) : null;
+			if (!Number.isFinite(this.fiveHourResetMs)) this.fiveHourResetMs = null;
 
-				const session = modelsFiveHour[m] || fallbackFiveHour;
-				const name = CC.MODEL_NAMES?.[m] || m;
-
-				if (isNewChat || m === activeModel) {
-					mg.group.classList.remove('cc-hidden');
-					const barWidth = isNewChat ? (CC.MODEL_WIDTHS?.[m] || '96px') : '200px';
+			if (isNewChat) {
+				// --- New-chat screen: multimodal preview of the shared 5h window ---
+				// Sonnet carries the exact reported figure; Haiku and Opus are scaled
+				// by their relative burn rate (CC.MODEL_USAGE_MULTIPLIERS).
+				const visibleModels = this._planModelKeys();
+				for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+					const mg = this.modelGroups?.[m];
+					if (!mg) continue;
+					if (!visibleModels.includes(m)) {
+						this._hideGroup(mg);
+						continue;
+					}
+					const barWidth = CC.MODEL_WIDTHS?.[m] || '96px';
 					mg.bar.style.width = barWidth;
 					mg.bar.style.flex = `0 0 ${barWidth}`;
-					if (session && typeof session.utilization === 'number') {
-						const rawPct = session.utilization;
-						const pct = Math.round(rawPct * 10) / 10;
-						mg.resetMs = session.resets_at ? Date.parse(session.resets_at) : null;
-						const windowHours = session.window_hours || 5;
-						mg.windowStartMs = mg.resetMs ? mg.resetMs - windowHours * 60 * 60 * 1000 : null;
-						const resetText = (!isNewChat && mg.resetMs) ? ` · resets in ${formatResetCountdown(mg.resetMs)}` : '';
-						mg.usageSpan.textContent = `${name}: ${pct}%${resetText}`;
+					// The shared countdown lives in the trailing indicator instead of
+					// being repeated on all three bars.
+					this._paintGroup(mg, modelsFiveHour[m] || fiveHour, CC.MODEL_NAMES?.[m] || m, { showReset: false });
+				}
 
-						const width = Math.max(0, Math.min(100, rawPct));
-						mg.barFill.style.width = `${width}%`;
-						mg.barFill.classList.toggle('cc-warn', width >= 90);
-						mg.barFill.classList.toggle('cc-full', width >= 99.5);
-					} else {
-						mg.usageSpan.textContent = `${name}: 0%`;
-						mg.barFill.style.width = '0%';
-						mg.barFill.classList.remove('cc-warn', 'cc-full');
-						mg.resetMs = null;
-						mg.windowStartMs = null;
+				// Weekly bars stay off the new-chat screen, as before.
+				for (const win of (CC.WINDOWS || [])) this._hideGroup(this.windowGroups?.[win.key]);
+
+				if (this.fiveHourIndicator) {
+					this.fiveHourIndicator.style.display = '';
+					const resetText = this.fiveHourResetMs ? ` · resets in ${formatResetCountdown(this.fiveHourResetMs)}` : '';
+					this.fiveHourIndicator.textContent = `5h limit${resetText}`;
+				}
+			} else {
+				// --- Inside a conversation: the real windows, no scaling ---
+				for (const mg of Object.values(this.modelGroups || {})) this._hideGroup(mg);
+
+				const planWindows = this._planWindowKeys();
+				for (const win of (CC.WINDOWS || [])) {
+					const wg = this.windowGroups?.[win.key];
+					if (!wg) continue;
+					const data = usage?.[win.key] || null;
+					// The API is authoritative: anything it returned is rendered even if
+					// the detected plan says this window shouldn't exist, so a wrong plan
+					// can never erase a real bar.
+					//
+					// The plan spec's only job is the reverse case: if usage came back but
+					// omitted a window this plan is supposed to have, show a '--'
+					// placeholder rather than silently nothing - that's a reporting gap
+					// the user should be able to see.
+					const expected = planWindows.includes(win.key);
+					if (!data && !(expected && hasAnyUsage)) {
+						this._hideGroup(wg);
+						continue;
 					}
-				} else {
-					mg.group.classList.add('cc-hidden');
+					this._paintGroup(wg, data, win.label, { defaultHours: win.hours });
 				}
-			}
 
-			// 2. Weekly Bar (7-day limit)
-			const hasWeekly = !isNewChat && weekly && typeof weekly.utilization === 'number';
-			this.weeklyGroup?.classList.toggle('cc-hidden', !hasWeekly);
-
-			if (hasWeekly) {
-				this.weeklyUsageSpan.classList.remove('cc-hidden');
-				this.weeklyBar.classList.remove('cc-hidden');
-				this.weeklyBar.style.width = '200px';
-				this.weeklyBar.style.flex = '0 0 200px';
-
-				const rawPct = weekly.utilization;
-				const pct = Math.round(rawPct * 10) / 10;
-				this.weeklyResetMs = weekly.resets_at ? Date.parse(weekly.resets_at) : null;
-				const weeklyHours = weekly.window_hours || (7 * 24);
-				this.weeklyWindowStartMs = this.weeklyResetMs ? this.weeklyResetMs - weeklyHours * 60 * 60 * 1000 : null;
-				const resetText = this.weeklyResetMs ? ` · resets in ${formatResetCountdown(this.weeklyResetMs)}` : '';
-				this.weeklyUsageSpan.textContent = `Weekly: ${pct}%${resetText}`;
-
-				const width = Math.max(0, Math.min(100, rawPct));
-				this.weeklyBarFill.style.width = `${width}%`;
-				this.weeklyBarFill.classList.toggle('cc-warn', width >= 90);
-				this.weeklyBarFill.classList.toggle('cc-full', width >= 99.5);
-			} else if (this.weeklyGroup) {
-				this.weeklyUsageSpan.classList.add('cc-hidden');
-				this.weeklyBar.classList.add('cc-hidden');
-				this.weeklyResetMs = null;
-				this.weeklyWindowStartMs = null;
-				this.weeklyBarFill.classList.remove('cc-warn', 'cc-full');
-			}
-
-			// 3. Overuse Credits Bar - removed per requirement
-			const hasOveruse = false;
-			this.overuseGroup?.classList.toggle('cc-hidden', true);
-
-			if (hasOveruse) {
-				let label = 'Overuse';
-				const pct = typeof overuse.utilization === 'number' ? Math.round(overuse.utilization * 10) / 10 : null;
-				if (typeof overuse.used === 'number' && typeof overuse.limit === 'number') {
-					label = `Overuse: $${overuse.used}/$${overuse.limit}${pct !== null ? ` (${pct}%)` : ''}`;
-				} else if (pct !== null) {
-					label = `Overuse: ${pct}%`;
-				} else if (typeof overuse.used === 'number') {
-					label = `Overuse: $${overuse.used}`;
-				}
-				this.overuseUsageSpan.textContent = label;
-
-				const width = Math.max(0, Math.min(100, overuse.utilization || 0));
-				this.overuseBarFill.style.width = `${width}%`;
-				this.overuseBarFill.classList.toggle('cc-warn', width >= 90);
-				this.overuseBarFill.classList.toggle('cc-full', width >= 99.5);
+				if (this.fiveHourIndicator) this.fiveHourIndicator.style.display = 'none';
 			}
 
 			this._updateMarkers();
@@ -1054,31 +1529,29 @@
 		_updateMarkers() {
 			const now = Date.now();
 
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (!mg) continue;
-				const shouldShowMarker = this.isNewChat ? (m === 'sonnet') : (m === this.activeModel);
-				if (shouldShowMarker && mg.marker && mg.windowStartMs && mg.resetMs) {
-					const total = mg.resetMs - mg.windowStartMs;
-					const elapsed = Math.max(0, Math.min(total, now - mg.windowStartMs));
-					const ratio = total > 0 ? elapsed / total : 0;
-					const pct = Math.max(0, Math.min(100, ratio * 100));
-					mg.marker.classList.remove('cc-hidden');
-					mg.marker.style.left = `${pct}%`;
-				} else if (mg.marker) {
-					mg.marker.classList.add('cc-hidden');
+			const place = (group, show) => {
+				if (!group?.marker) return;
+				if (!show || !group.windowStartMs || !group.resetMs) {
+					group.marker.classList.add('cc-hidden');
+					return;
 				}
+				const total = group.resetMs - group.windowStartMs;
+				const elapsed = Math.max(0, Math.min(total, now - group.windowStartMs));
+				const ratio = total > 0 ? elapsed / total : 0;
+				group.marker.classList.remove('cc-hidden');
+				group.marker.style.left = `${Math.max(0, Math.min(100, ratio * 100))}%`;
+			};
+
+			// New chat: one marker, on Sonnet - the three bars share one window, so
+			// three identical markers would just be noise.
+			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
+				place(this.modelGroups?.[m], this.isNewChat && m === 'sonnet');
 			}
 
-			if (this.weeklyMarker && this.weeklyWindowStartMs && this.weeklyResetMs) {
-				const total = this.weeklyResetMs - this.weeklyWindowStartMs;
-				const elapsed = Math.max(0, Math.min(total, now - this.weeklyWindowStartMs));
-				const ratio = total > 0 ? elapsed / total : 0;
-				const pct = Math.max(0, Math.min(100, ratio * 100));
-				this.weeklyMarker.classList.remove('cc-hidden');
-				this.weeklyMarker.style.left = `${pct}%`;
-			} else if (this.weeklyMarker) {
-				this.weeklyMarker.classList.add('cc-hidden');
+			// In a conversation every visible window gets its own marker; they have
+			// genuinely different spans.
+			for (const win of (CC.WINDOWS || [])) {
+				place(this.windowGroups?.[win.key], !this.isNewChat);
 			}
 		}
 
@@ -1098,24 +1571,14 @@
 				this._renderHeader();
 			}
 
-			// Reset countdown text
-			for (const m of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-				const mg = this.modelGroups?.[m];
-				if (mg?.resetMs && mg?.usageSpan?.textContent) {
-					const idx = mg.usageSpan.textContent.indexOf('· resets in');
-					if (idx !== -1) {
-						const prefix = mg.usageSpan.textContent.slice(0, idx + '· resets in '.length);
-						mg.usageSpan.textContent = `${prefix}${formatResetCountdown(mg.resetMs)}`;
-					}
-				}
-			}
-
-			if (this.weeklyResetMs && this.weeklyUsageSpan?.textContent) {
-				const idx = this.weeklyUsageSpan.textContent.indexOf('· resets in');
-				if (idx !== -1) {
-					const prefix = this.weeklyUsageSpan.textContent.slice(0, idx + '· resets in '.length);
-					this.weeklyUsageSpan.textContent = `${prefix}${formatResetCountdown(this.weeklyResetMs)}`;
-				}
+			// Reset countdown text. Patched in place rather than re-rendered.
+			const groups = [...Object.values(this.modelGroups || {}), ...Object.values(this.windowGroups || {})];
+			for (const group of groups) {
+				if (!group?.resetMs || !group?.usageSpan?.textContent) continue;
+				const idx = group.usageSpan.textContent.indexOf('· resets in');
+				if (idx === -1) continue;
+				const prefix = group.usageSpan.textContent.slice(0, idx + '· resets in '.length);
+				group.usageSpan.textContent = `${prefix}${formatResetCountdown(group.resetMs)}`;
 			}
 
 			if (this.isNewChat && this.fiveHourResetMs && this.fiveHourIndicator?.textContent) {
@@ -1145,7 +1608,7 @@
 	CC.__ccUserscriptStarted = true;
 
 	const STYLE_ID = 'cc-userscript-styles';
-	const STYLES = "/* Header: tokens + cache timer */\n.cc-header {\n\tmargin-top: 2px;\n\tuser-select: none;\n}\n\n.cc-headerItem {\n\twhite-space: nowrap;\n}\n\n/* Usage row: session + weekly */\n.cc-usageRow {\n\tposition: relative;\n\tz-index: 50;\n\tcursor: pointer;\n\tuser-select: none;\n\ttransition: opacity 150ms ease;\n\tflex-wrap: nowrap;\n}\n\n.cc-usageRow--dim {\n\topacity: 0.6;\n}\n\n.cc-usageGroup {\n\tdisplay: flex;\n\talign-items: center;\n\tgap: 6px;\n\tflex: 1 1 auto;\n\tmin-width: 0;\n}\n\n.cc-usageGroup--model {\n\tflex: 0 0 auto;\n}\n\n.cc-usageGroup--single {\n\twidth: 100%;\n}\n\n.cc-usageGroup--weekly {\n\tjustify-content: flex-end;\n}\n\n.cc-usageGroup--overuse {\n\tflex: 0 0 auto;\n\tjustify-content: flex-end;\n}\n\n.cc-usageText {\n\twhite-space: nowrap;\n}\n\n/* Bars (mini + usage) */\n.cc-bar {\n\t--cc-radius: 3px;\n\t--cc-stroke: transparent;\n\t--cc-fill: transparent;\n\t--cc-fill-warn: var(--cc-fill);\n\t--cc-marker: transparent;\n\n\tposition: relative;\n\tbox-sizing: border-box;\n\twidth: 100%;\n\theight: 6px;\n\tborder-radius: var(--cc-radius);\n\tborder: 1px solid var(--cc-stroke);\n\toverflow: visible;\n\tuser-select: none;\n}\n\n.cc-bar__fill {\n\twidth: 0%;\n\theight: 100%;\n\tbackground: var(--cc-fill);\n\ttransition: width 300ms ease, background-color 300ms ease;\n\tborder-top-left-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-bottom-left-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-top-right-radius: 0;\n\tborder-bottom-right-radius: 0;\n}\n\n.cc-bar__fill.cc-full {\n\tborder-top-right-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-bottom-right-radius: max(0px, calc(var(--cc-radius) - 1px));\n}\n\n.cc-bar__fill.cc-warn {\n\tbackground: var(--cc-fill-warn);\n}\n\n.cc-bar__marker {\n\tposition: absolute;\n\ttop: 0;\n\tbottom: 0;\n\tleft: 0%;\n\twidth: 2px;\n\tbackground: var(--cc-marker);\n\tpointer-events: none;\n}\n\n.cc-bar--mini {\n\twidth: 60px;\n\theight: 7px;\n\t--cc-radius: 2px;\n}\n\n.cc-bar--usage {\n\theight: 10px;\n\tflex: 1;\n}\n\n/* Tooltips */\n.cc-tooltip {\n\tposition: fixed;\n\tz-index: 9999;\n\tpadding: 4px 8px;\n\tborder-radius: 4px;\n\tfont-size: 12px;\n\twhite-space: pre-line;\n\tuser-select: none;\n\tpointer-events: none;\n\topacity: 0;\n\ttransition: opacity 200ms ease;\n}\n\n.cc-tooltipTrigger {\n\t-webkit-touch-callout: none;\n\t-webkit-user-select: none;\n\tuser-select: none;\n\tcursor: help;\n}\n\n/* Hide optional elements completely (no layout space) */\n.cc-hidden {\n\tdisplay: none !important;\n}\n\n/* ==========================================================================\n   Gemini (gemini.google.com)\n   Reuses the .cc-bar primitives above. Gemini has none of Claude's utility\n   classes, so everything here is plain CSS.\n   ========================================================================== */\n\n.gc-usageRow {\n\t--gc-text: #5f6368;\n\n\tdisplay: flex;\n\tflex-direction: row;\n\talign-items: center;\n\tgap: 16px;\n\tflex-wrap: nowrap;\n\twidth: 100%;\n\tbox-sizing: border-box;\n\tmargin: 6px 0 2px;\n\tpadding: 0 4px;\n\tfont-size: 11px;\n\tline-height: 1.4;\n\tcolor: var(--gc-text);\n\tuser-select: none;\n}\n\n.gc-usageGroup {\n\tdisplay: flex;\n\talign-items: center;\n\tgap: 6px;\n\tflex: 1 1 0;\n\tmin-width: 0;\n}\n\n.gc-usageText {\n\twhite-space: nowrap;\n\tflex-shrink: 0;\n}\n\n.gc-usageRow .cc-bar--usage {\n\tflex: 1 1 auto;\n\tmin-width: 48px;\n}\n\n.gc-tierButton {\n\tflex-shrink: 0;\n\tmargin-left: auto;\n\tpadding: 1px 6px;\n\tborder: 1px solid var(--gc-stroke, #c4c7c5);\n\tborder-radius: 10px;\n\tbackground: transparent;\n\tcolor: var(--gc-text);\n\tfont: inherit;\n\tfont-size: 10px;\n\tline-height: 1.4;\n\twhite-space: nowrap;\n\tcursor: pointer;\n\topacity: 0.85;\n\ttransition: opacity 150ms ease;\n}\n\n.gc-tierButton:hover {\n\topacity: 1;\n}\n\n/* Gemini gradient fill.\n   The gradient must span the full bar, not the filled portion, or a 20% fill\n   would squash all five stops into a fifth of the bar. So the fill is always\n   full width and is revealed left-to-right with clip-path. */\n.cc-bar--gemini .cc-bar__fill {\n\twidth: 100%;\n\tbackground: linear-gradient(90deg, #1ba1e3 0%, #5489d6 25%, #9b72cb 50%, #d96570 75%, #f49c46 100%);\n\tclip-path: inset(0 calc(100% - var(--cc-pct, 0%)) 0 0);\n\ttransition: clip-path 300ms ease, background 300ms ease;\n\tborder-radius: max(0px, calc(var(--cc-radius) - 1px));\n}\n\n/* Near the cap, drop the gradient for the same solid red the context bar uses. */\n.cc-bar--gemini .cc-bar__fill.cc-warn {\n\tbackground: var(--cc-fill-warn);\n}\n\n.gc-tooltip {\n\tbackground: #1f1f1f;\n\tcolor: #e3e3e3;\n\tbox-shadow: 0 1px 3px rgb(0 0 0 / 30%);\n\tmax-width: 320px;\n}\n\n@media (prefers-color-scheme: light) {\n\t.gc-tooltip {\n\t\tbackground: #303030;\n\t\tcolor: #f1f3f4;\n\t}\n}\n";
+	const STYLES = "/* Header: tokens + cache timer */\n.cc-header {\n\tmargin-top: 2px;\n\tuser-select: none;\n}\n\n.cc-headerItem {\n\twhite-space: nowrap;\n}\n\n/* Usage row: session + weekly */\n.cc-usageRow {\n\tposition: relative;\n\tz-index: 50;\n\tcursor: pointer;\n\tuser-select: none;\n\ttransition: opacity 150ms ease;\n\tflex-wrap: nowrap;\n}\n\n.cc-usageRow--dim {\n\topacity: 0.6;\n}\n\n.cc-usageGroup {\n\tdisplay: flex;\n\talign-items: center;\n\tgap: 6px;\n\tflex: 1 1 auto;\n\tmin-width: 0;\n}\n\n.cc-usageGroup--model {\n\tflex: 0 0 auto;\n}\n\n.cc-usageGroup--single {\n\twidth: 100%;\n}\n\n/* Rate-limit window bars (in-conversation). Their track carries an explicit\n   width, so the group must not stretch. */\n.cc-usageGroup--window {\n\tflex: 0 0 auto;\n}\n\n/* The weekly windows render bar-then-label, so they hug the right. */\n.cc-usageGroup--seven_day,\n.cc-usageGroup--seven_day_opus {\n\tjustify-content: flex-end;\n}\n\n.cc-usageText {\n\twhite-space: nowrap;\n}\n\n/* Bars (mini + usage) */\n.cc-bar {\n\t--cc-radius: 3px;\n\t--cc-stroke: transparent;\n\t--cc-fill: transparent;\n\t--cc-fill-warn: var(--cc-fill);\n\t--cc-marker: transparent;\n\n\tposition: relative;\n\tbox-sizing: border-box;\n\twidth: 100%;\n\theight: 6px;\n\tborder-radius: var(--cc-radius);\n\tborder: 1px solid var(--cc-stroke);\n\toverflow: visible;\n\tuser-select: none;\n}\n\n.cc-bar__fill {\n\twidth: 0%;\n\theight: 100%;\n\tbackground: var(--cc-fill);\n\ttransition: width 300ms ease, background-color 300ms ease;\n\tborder-top-left-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-bottom-left-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-top-right-radius: 0;\n\tborder-bottom-right-radius: 0;\n}\n\n.cc-bar__fill.cc-full {\n\tborder-top-right-radius: max(0px, calc(var(--cc-radius) - 1px));\n\tborder-bottom-right-radius: max(0px, calc(var(--cc-radius) - 1px));\n}\n\n.cc-bar__fill.cc-warn {\n\tbackground: var(--cc-fill-warn);\n}\n\n.cc-bar__marker {\n\tposition: absolute;\n\ttop: 0;\n\tbottom: 0;\n\tleft: 0%;\n\twidth: 2px;\n\tbackground: var(--cc-marker);\n\tpointer-events: none;\n}\n\n.cc-bar--mini {\n\twidth: 60px;\n\theight: 7px;\n\t--cc-radius: 2px;\n}\n\n.cc-bar--usage {\n\theight: 10px;\n\tflex: 1;\n}\n\n/* Tooltips */\n.cc-tooltip {\n\tposition: fixed;\n\tz-index: 9999;\n\tpadding: 4px 8px;\n\tborder-radius: 4px;\n\tfont-size: 12px;\n\twhite-space: pre-line;\n\tuser-select: none;\n\tpointer-events: none;\n\topacity: 0;\n\ttransition: opacity 200ms ease;\n}\n\n.cc-tooltipTrigger {\n\t-webkit-touch-callout: none;\n\t-webkit-user-select: none;\n\tuser-select: none;\n\tcursor: help;\n}\n\n/* Hide optional elements completely (no layout space) */\n.cc-hidden {\n\tdisplay: none !important;\n}\n\n/* ==========================================================================\n   Gemini (gemini.google.com)\n   Reuses the .cc-bar primitives above. Gemini has none of Claude's utility\n   classes, so everything here is plain CSS.\n   ========================================================================== */\n\n.gc-usageRow {\n\t--gc-text: #5f6368;\n\n\tdisplay: flex;\n\tflex-direction: row;\n\talign-items: center;\n\tgap: 16px;\n\tflex-wrap: nowrap;\n\twidth: 100%;\n\tbox-sizing: border-box;\n\tmargin: 6px 0 2px;\n\tpadding: 0 4px;\n\tfont-size: 11px;\n\tline-height: 1.4;\n\tcolor: var(--gc-text);\n\tuser-select: none;\n}\n\n.gc-usageGroup {\n\tdisplay: flex;\n\talign-items: center;\n\tgap: 6px;\n\tflex: 1 1 0;\n\tmin-width: 0;\n}\n\n.gc-usageText {\n\twhite-space: nowrap;\n\tflex-shrink: 0;\n}\n\n.gc-usageRow .cc-bar--usage {\n\tflex: 1 1 auto;\n\tmin-width: 48px;\n}\n\n.gc-tierButton,\n.cc-planButton {\n\tflex-shrink: 0;\n\tmargin-left: auto;\n\tpadding: 1px 6px;\n\tborder-radius: 10px;\n\tbackground: transparent;\n\tfont: inherit;\n\tfont-size: 10px;\n\tline-height: 1.4;\n\twhite-space: nowrap;\n\tcursor: pointer;\n\topacity: 0.85;\n\ttransition: opacity 150ms ease;\n}\n\n.gc-tierButton {\n\tborder: 1px solid var(--gc-stroke, #c4c7c5);\n\tcolor: var(--gc-text);\n}\n\n/* Picks up the terracotta chrome refreshProgressChrome sets on the row. */\n.cc-planButton {\n\tborder: 1px solid var(--cc-stroke, #bfbfbf);\n\tcolor: inherit;\n}\n\n.gc-tierButton:hover,\n.cc-planButton:hover {\n\topacity: 1;\n}\n\n/* Gemini gradient fill.\n   The gradient must span the full bar, not the filled portion, or a 20% fill\n   would squash all five stops into a fifth of the bar. So the fill is always\n   full width and is revealed left-to-right with clip-path. */\n.cc-bar--gemini .cc-bar__fill {\n\twidth: 100%;\n\tbackground: linear-gradient(90deg, #1ba1e3 0%, #5489d6 25%, #9b72cb 50%, #d96570 75%, #f49c46 100%);\n\tclip-path: inset(0 calc(100% - var(--cc-pct, 0%)) 0 0);\n\ttransition: clip-path 300ms ease, background 300ms ease;\n\tborder-radius: max(0px, calc(var(--cc-radius) - 1px));\n}\n\n/* Near the cap, drop the gradient for the same solid red the context bar uses. */\n.cc-bar--gemini .cc-bar__fill.cc-warn {\n\tbackground: var(--cc-fill-warn);\n}\n\n.gc-tooltip {\n\tbackground: #1f1f1f;\n\tcolor: #e3e3e3;\n\tbox-shadow: 0 1px 3px rgb(0 0 0 / 30%);\n\tmax-width: 320px;\n}\n\n@media (prefers-color-scheme: light) {\n\t.gc-tooltip {\n\t\tbackground: #303030;\n\t\tcolor: #f1f3f4;\n\t}\n}\n";
 
 	function injectStyles() {
 		if (document.getElementById(STYLE_ID)) return;
@@ -1234,42 +1697,35 @@
 		return { utilization, used, limit, raw: cand };
 	}
 
-	function parseModelWindows(rawObj, windowKey, fallbackWin) {
+	/**
+	 * /usage sends utilization as 0-100 but the SSE message_limit sends 0-1.
+	 * Assuming one or the other silently multiplies (or divides) every reading by
+	 * 100, so infer it: a genuine fraction can't exceed 1, and 1% of a window is
+	 * close enough to 100% of nothing that the tie doesn't matter.
+	 */
+	function toPercent(value) {
+		if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+		const pct = value <= 1 ? value * 100 : value;
+		return Math.max(0, Math.min(100, pct));
+	}
+
+	/**
+	 * Scaled per-model view of the shared 5-hour window, for the new-chat screen
+	 * only. Anthropic reports ONE five_hour utilization; Sonnet shows it verbatim
+	 * and the others are scaled by CC.MODEL_USAGE_MULTIPLIERS to preview relative
+	 * burn rate. Intentional approximation - see the note on that constant.
+	 */
+	function scaleModelWindows(fiveHour) {
+		if (!fiveHour || typeof fiveHour.utilization !== 'number') return {};
 		const out = {};
-		const baseUtil =
-			rawObj[`${windowKey}_sonnet`]?.utilization ??
-			rawObj[windowKey]?.sonnet?.utilization ??
-			fallbackWin?.utilization ??
-			rawObj[`${windowKey}_opus`]?.utilization ??
-			rawObj[`${windowKey}_haiku`]?.utilization ??
-			0;
-
-		const baseResetsAt =
-			rawObj[`${windowKey}_sonnet`]?.resets_at ??
-			rawObj[windowKey]?.sonnet?.resets_at ??
-			fallbackWin?.resets_at ??
-			rawObj[`${windowKey}_opus`]?.resets_at ??
-			rawObj[`${windowKey}_haiku`]?.resets_at ??
-			null;
-
 		for (const model of (CC.MODELS || ['haiku', 'sonnet', 'opus'])) {
-			const specKey = `${windowKey}_${model}`;
 			const mult = CC.MODEL_USAGE_MULTIPLIERS?.[model] ?? 1.0;
-
-			let util = baseUtil * mult;
-			let resetsAt = baseResetsAt;
-
-			if (rawObj[specKey] && typeof rawObj[specKey].resets_at === 'string') {
-				resetsAt = rawObj[specKey].resets_at;
-			} else if (rawObj[windowKey] && typeof rawObj[windowKey][model] === 'object' && typeof rawObj[windowKey][model].resets_at === 'string') {
-				resetsAt = rawObj[windowKey][model].resets_at;
-			}
-
-			out[model] = fallbackWin || baseUtil > 0 ? {
-				utilization: Math.max(0, Math.min(100, util)),
-				resets_at: resetsAt,
-				window_hours: fallbackWin?.window_hours || 5
-			} : null;
+			out[model] = {
+				utilization: Math.max(0, Math.min(100, fiveHour.utilization * mult)),
+				resets_at: fiveHour.resets_at,
+				window_hours: fiveHour.window_hours || 5,
+				scaled: model !== 'sonnet'
+			};
 		}
 		return out;
 	}
@@ -1279,19 +1735,25 @@
 
 		const normalizeWindow = (w, hours) => {
 			if (!w || typeof w !== 'object') return null;
-			if (typeof w.utilization !== 'number' || !Number.isFinite(w.utilization)) return null;
-			const utilization = Math.max(0, Math.min(100, w.utilization));
+			const utilization = toPercent(w.utilization);
+			if (utilization === null) return null;
 			const resets_at = typeof w.resets_at === 'string' ? w.resets_at : null;
 			return { utilization, resets_at, window_hours: hours };
 		};
 
 		const fiveHour = normalizeWindow(raw.five_hour, 5);
 		const sevenDay = normalizeWindow(raw.seven_day, 24 * 7);
+		const sevenDayOpus = normalizeWindow(raw.seven_day_opus || raw.seven_day?.opus, 24 * 7);
 		const overuse = parseOveruse(raw);
-		const models_five_hour = parseModelWindows(raw, 'five_hour', fiveHour);
 
-		if (!fiveHour && !sevenDay && !overuse) return null;
-		return { five_hour: fiveHour, seven_day: sevenDay, overuse, models_five_hour };
+		if (!fiveHour && !sevenDay && !sevenDayOpus && !overuse) return null;
+		return {
+			five_hour: fiveHour,
+			seven_day: sevenDay,
+			seven_day_opus: sevenDayOpus,
+			overuse,
+			models_five_hour: scaleModelWindows(fiveHour)
+		};
 	}
 
 	function parseUsageFromMessageLimit(raw) {
@@ -1299,21 +1761,28 @@
 
 		const normalizeWindow = (w, hours) => {
 			if (!w || typeof w !== 'object') return null;
-			if (typeof w.utilization !== 'number' || !Number.isFinite(w.utilization)) return null;
-			const utilization = Math.max(0, Math.min(100, w.utilization * 100));
+			const utilization = toPercent(w.utilization);
+			if (utilization === null) return null;
 			const resets_at = typeof w.resets_at === 'number' && Number.isFinite(w.resets_at)
 				? new Date(w.resets_at * 1000).toISOString()
-				: null;
+				: typeof w.resets_at === 'string' ? w.resets_at : null;
 			return { utilization, resets_at, window_hours: hours };
 		};
 
-		const fiveHour = normalizeWindow(raw.windows['5h'], 5);
-		const sevenDay = normalizeWindow(raw.windows['7d'], 24 * 7);
+		const windows = raw.windows;
+		const fiveHour = normalizeWindow(windows['5h'], 5);
+		const sevenDay = normalizeWindow(windows['7d'], 24 * 7);
+		const sevenDayOpus = normalizeWindow(windows['7d_opus'] || windows['7d_oauth_apps_opus'], 24 * 7);
 		const overuse = parseOveruse(raw);
-		const models_five_hour = parseModelWindows(raw.windows || {}, '5h', fiveHour);
 
-		if (!fiveHour && !sevenDay && !overuse) return null;
-		return { five_hour: fiveHour, seven_day: sevenDay, overuse, models_five_hour };
+		if (!fiveHour && !sevenDay && !sevenDayOpus && !overuse) return null;
+		return {
+			five_hour: fiveHour,
+			seven_day: sevenDay,
+			seven_day_opus: sevenDayOpus,
+			overuse,
+			models_five_hour: scaleModelWindows(fiveHour)
+		};
 	}
 
 	let currentConversationId = null;
@@ -1321,11 +1790,13 @@
 	let currentOrgId = null;
 
 	let usageState = null;
-	let usageResetMs = { five_hour: null, seven_day: null };
+	// Cached parsed timestamps, keyed by CC.WINDOWS key, so tick() avoids Date.parse.
+	let usageResetMs = { five_hour: null, seven_day: null, seven_day_opus: null };
 	let lastUsageSseMs = 0;
 	let usageFetchInFlight = false;
 	let lastUsageUpdateMs = 0;
-	const rolloverHandledForResetMs = { five_hour: null, seven_day: null };
+	let lastUsageFetchMs = 0;
+	const rolloverHandledForResetMs = { five_hour: null, seven_day: null, seven_day_opus: null };
 
 	function detectActiveModel() {
 		if (currentConversationModel) {
@@ -1342,11 +1813,25 @@
 
 	const ui = new CC.ui.CounterUI({
 		onUsageRefresh: async () => {
-			await refreshUsage();
+			await refreshUsage({ force: true });
+		},
+		onPlanCycle: () => {
+			CC.plan.cycle();
+			renderUsage();
 		}
 	});
 
 	const originalFetch = CC._ccInternal?.originalFetch || (window.fetch ? window.fetch.bind(window) : null);
+
+	/** Re-render from the last snapshot without re-fetching. */
+	function renderUsage() {
+		if (!usageState) return;
+		ui.setUsage(usageState, {
+			isNewChat: !currentConversationId,
+			activeModel: detectActiveModel(),
+			plan: CC.plan.get()
+		});
+	}
 
 	function applyUsageUpdate(normalized, source) {
 		if (!normalized) return;
@@ -1354,12 +1839,13 @@
 		usageState = normalized;
 		lastUsageUpdateMs = now;
 		if (source === 'sse') lastUsageSseMs = now;
-		usageResetMs.five_hour = normalized.five_hour?.resets_at ? Date.parse(normalized.five_hour.resets_at) : null;
-		usageResetMs.seven_day = normalized.seven_day?.resets_at ? Date.parse(normalized.seven_day.resets_at) : null;
+		// Cache parsed timestamps to avoid Date.parse() every tick
+		for (const { key } of CC.WINDOWS) {
+			const resetsAt = normalized[key]?.resets_at;
+			usageResetMs[key] = resetsAt ? Date.parse(resetsAt) : null;
+		}
 
-		const isNewChat = !currentConversationId;
-		const activeModel = detectActiveModel();
-		ui.setUsage(normalized, { isNewChat, activeModel });
+		renderUsage();
 	}
 
 	function updateOrgIdIfNeeded(newOrgId) {
@@ -1388,13 +1874,21 @@
 		return json;
 	}
 
-	async function refreshUsage() {
+	/**
+	 * @param {{force?: boolean}} [opts] force skips the min-interval floor; used
+	 *   only for the explicit click-to-refresh, never for automatic triggers.
+	 */
+	async function refreshUsage({ force = false } = {}) {
 		const orgId = currentOrgId || getOrgIdFromCookie();
 		if (!orgId) return;
 		updateOrgIdIfNeeded(orgId);
 
 		if (usageFetchInFlight) return;
+		// Several triggers can fire off one message; keep /usage from being hammered.
+		if (!force && Date.now() - lastUsageFetchMs < CC.CONST.USAGE_MIN_INTERVAL_MS) return;
+
 		usageFetchInFlight = true;
+		lastUsageFetchMs = Date.now();
 		let raw;
 		try {
 			raw = await requestUsage(orgId);
@@ -1404,8 +1898,17 @@
 			usageFetchInFlight = false;
 		}
 
+		// The response shape itself tells us about the plan's window topology.
+		const planChanged = CC.plan.observeUsageShape(raw);
+
 		const parsed = parseUsageFromUsageEndpoint(raw);
-		applyUsageUpdate(parsed, 'usage');
+		if (parsed) applyUsageUpdate(parsed, 'usage');
+		else if (planChanged) renderUsage();
+	}
+
+	/** Re-fetch after `delayMs`. Coalesced by the floor inside refreshUsage. */
+	function scheduleUsageRefresh(delayMs) {
+		setTimeout(() => refreshUsage(), delayMs);
 	}
 
 	async function refreshConversation() {
@@ -1440,7 +1943,7 @@
 		const m = normalizeModelName(rawModel);
 		if (m) {
 			currentConversationModel = m;
-			if (usageState) applyUsageUpdate(usageState, 'conversation');
+			renderUsage();
 		}
 
 		const metrics = await CC.tokens.computeConversationMetrics(data);
@@ -1448,8 +1951,19 @@
 	}
 
 	function handleMessageLimit(messageLimit) {
+		// Apply immediately for instant feedback, then confirm against /usage - the
+		// SSE payload has been reshaped before, and an unrecognised shape parses to
+		// null, which would otherwise leave the bars frozen until the safety refresh.
 		const parsed = parseUsageFromMessageLimit(messageLimit);
 		applyUsageUpdate(parsed, 'sse');
+		scheduleUsageRefresh(CC.CONST.POST_GENERATION_DELAYS_MS[0]);
+	}
+
+	function handleGenerationEnd() {
+		// The server's usage counter lags the end of the stream, so check twice.
+		for (const delay of CC.CONST.POST_GENERATION_DELAYS_MS) {
+			scheduleUsageRefresh(delay);
+		}
 	}
 
 	async function handleUrlChange() {
@@ -1465,7 +1979,7 @@
 		if (!currentConversationId) {
 			currentConversationModel = null;
 			ui.setConversationMetrics();
-			if (usageState) applyUsageUpdate(usageState, 'url_change');
+			renderUsage();
 			return;
 		}
 
@@ -1476,41 +1990,62 @@
 		if (!usageState) {
 			await refreshUsage();
 		} else {
-			applyUsageUpdate(usageState, 'url_change');
+			renderUsage();
 		}
 	}
 
 	function tick() {
 		ui.tick();
 
+		// Refresh usage when a window ends. SSE won't fire at rollover unless a
+		// message is sent, so the rollover has to be noticed locally.
 		const now = Date.now();
-		if (usageResetMs.five_hour && now >= usageResetMs.five_hour && rolloverHandledForResetMs.five_hour !== usageResetMs.five_hour) {
-			rolloverHandledForResetMs.five_hour = usageResetMs.five_hour;
-			refreshUsage();
-		}
-		if (usageResetMs.seven_day && now >= usageResetMs.seven_day && rolloverHandledForResetMs.seven_day !== usageResetMs.seven_day) {
-			rolloverHandledForResetMs.seven_day = usageResetMs.seven_day;
-			refreshUsage();
+
+		for (const { key } of CC.WINDOWS) {
+			const resetMs = usageResetMs[key];
+			if (resetMs && now >= resetMs && rolloverHandledForResetMs[key] !== resetMs) {
+				rolloverHandledForResetMs[key] = resetMs;
+				refreshUsage({ force: true });
+			}
 		}
 
-		const ONE_HOUR_MS = 60 * 60 * 1000;
+		// Periodic safety refresh while the tab is visible. This used to be hourly,
+		// which meant a bar could sit an hour out of date mid-session whenever the
+		// SSE message_limit event didn't arrive.
 		const sseAge = now - lastUsageSseMs;
 		const anyAge = now - lastUsageUpdateMs;
-		if (!document.hidden && sseAge > ONE_HOUR_MS && anyAge > ONE_HOUR_MS) {
+		if (!document.hidden && sseAge > CC.CONST.USAGE_REFRESH_MS && anyAge > CC.CONST.USAGE_REFRESH_MS) {
 			refreshUsage();
 		}
 	}
 
-	function start() {
+	async function start() {
 		injectStyles();
 		ui.initialize();
 		CC._ccInternal.onGenerationStart = handleGenerationStart;
+		CC._ccInternal.onGenerationEnd = handleGenerationEnd;
 		CC._ccInternal.onConversationData = handleConversationPayload;
 		CC._ccInternal.onMessageLimit = handleMessageLimit;
 		CC._ccInternal.onUrlChange = handleUrlChange;
 
-		handleUrlChange();
+		document.addEventListener('visibilitychange', () => {
+			if (document.hidden) return;
+			if (Date.now() - lastUsageUpdateMs > CC.CONST.USAGE_STALE_ON_VISIBLE_MS) {
+				refreshUsage();
+			}
+		});
+
 		setInterval(tick, 1000);
+
+		// The stored plan gates which bars render, so load it before the first paint.
+		await CC.plan.load();
+		ui.setPlan(CC.plan.get());
+
+		handleUrlChange();
+
+		if (await CC.plan.detect({ orgId: currentOrgId || getOrgIdFromCookie() })) {
+			renderUsage();
+		}
 	}
 
 	if (document.readyState === 'loading') {
@@ -1827,73 +2362,9 @@
 
 	const GC = (globalThis.GeminiCounter = globalThis.GeminiCounter || {});
 
-	function getStorageArea() {
-		try {
-			return globalThis.browser?.storage?.local || globalThis.chrome?.storage?.local || null;
-		} catch {
-			return null;
-		}
-	}
-
-	/**
-	 * chrome.storage.local when running as an extension, localStorage otherwise
-	 * (the userscript build has no extension APIs). Both are local-only.
-	 */
-	const store = {
-		async get(key) {
-			const area = getStorageArea();
-			if (area) {
-				try {
-					const result = await new Promise((resolve, reject) => {
-						const maybePromise = area.get(key, (items) => {
-							const err = globalThis.chrome?.runtime?.lastError;
-							if (err) reject(new Error(err.message));
-							else resolve(items);
-						});
-						// Firefox returns a promise instead of using the callback.
-						if (maybePromise && typeof maybePromise.then === 'function') {
-							maybePromise.then(resolve, reject);
-						}
-					});
-					return result?.[key] ?? null;
-				} catch {
-					// fall through to localStorage
-				}
-			}
-			try {
-				const raw = localStorage.getItem(key);
-				return raw ? JSON.parse(raw) : null;
-			} catch {
-				return null;
-			}
-		},
-
-		async set(key, value) {
-			const area = getStorageArea();
-			if (area) {
-				try {
-					await new Promise((resolve, reject) => {
-						const maybePromise = area.set({ [key]: value }, () => {
-							const err = globalThis.chrome?.runtime?.lastError;
-							if (err) reject(new Error(err.message));
-							else resolve();
-						});
-						if (maybePromise && typeof maybePromise.then === 'function') {
-							maybePromise.then(resolve, reject);
-						}
-					});
-					return;
-				} catch {
-					// fall through to localStorage
-				}
-			}
-			try {
-				localStorage.setItem(key, JSON.stringify(value));
-			} catch {
-				// storage full or blocked; usage tracking degrades to in-memory
-			}
-		}
-	};
+	// chrome.storage.local with a localStorage fallback; see the shared CCStore
+	// IIFE at the top of this file.
+	const store = globalThis.CCStore;
 
 	function emptyWindow() {
 		return { start: null, credits: 0 };

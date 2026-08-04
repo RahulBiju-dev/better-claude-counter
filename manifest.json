@@ -34,8 +34,10 @@
       "matches": ["https://claude.ai/*"],
       "css": ["src/styles.css"],
       "js": [
+        "src/shared/store.js",
         "src/content/constants.js",
         "src/content/bridge-client.js",
+        "src/content/plan.js",
         "src/vendor/o200k_base.js",
         "src/content/tokens.js",
         "src/content/ui.js",
@@ -47,6 +49,7 @@
       "css": ["src/styles.css"],
       "run_at": "document_start",
       "js": [
+        "src/shared/store.js",
         "src/gemini/constants.js",
         "src/gemini/bridge-client.js",
         "src/gemini/estimator.js",

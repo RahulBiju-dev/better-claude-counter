@@ -38,12 +38,15 @@
 	width: 100%;
 }
 
-.cc-usageGroup--weekly {
-	justify-content: flex-end;
+/* Rate-limit window bars (in-conversation). Their track carries an explicit
+   width, so the group must not stretch. */
+.cc-usageGroup--window {
+	flex: 0 0 auto;
 }
 
-.cc-usageGroup--overuse {
-	flex: 0 0 auto;
+/* The weekly windows render bar-then-label, so they hug the right. */
+.cc-usageGroup--seven_day,
+.cc-usageGroup--seven_day_opus {
 	justify-content: flex-end;
 }
 
@@ -178,14 +181,13 @@
 	min-width: 48px;
 }
 
-.gc-tierButton {
+.gc-tierButton,
+.cc-planButton {
 	flex-shrink: 0;
 	margin-left: auto;
 	padding: 1px 6px;
-	border: 1px solid var(--gc-stroke, #c4c7c5);
 	border-radius: 10px;
 	background: transparent;
-	color: var(--gc-text);
 	font: inherit;
 	font-size: 10px;
 	line-height: 1.4;
@@ -195,7 +197,19 @@
 	transition: opacity 150ms ease;
 }
 
-.gc-tierButton:hover {
+.gc-tierButton {
+	border: 1px solid var(--gc-stroke, #c4c7c5);
+	color: var(--gc-text);
+}
+
+/* Picks up the terracotta chrome refreshProgressChrome sets on the row. */
+.cc-planButton {
+	border: 1px solid var(--cc-stroke, #bfbfbf);
+	color: inherit;
+}
+
+.gc-tierButton:hover,
+.cc-planButton:hover {
 	opacity: 1;
 }
 

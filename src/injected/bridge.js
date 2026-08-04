@@ -94,10 +94,12 @@
 	}
 
 	async function handleEventStream(response) {
+		let started = false;
 		try {
 			const cloned = response.clone();
 			const reader = cloned.body?.getReader?.();
 			if (!reader) return;
+			started = true;
 			const decoder = new TextDecoder();
 			let buffer = '';
 
@@ -124,6 +126,11 @@
 			}
 		} catch {
 			// best-effort; don't break claude.ai
+		} finally {
+			// The stream ending is the reliable "a message just completed" signal.
+			// message_limit only rides along on some completions, so this is what
+			// drives the post-generation /usage re-fetch.
+			if (started) post('cc:generation_end', {});
 		}
 	}
 
@@ -157,6 +164,28 @@
 				});
 				const json = await res.json();
 				postResponse(requestId, true, json, null);
+				return;
+			}
+
+			if (kind === 'account') {
+				// Plan detection. Both endpoints are undocumented and either may be
+				// absent or reshaped, so they are fetched independently and a failure
+				// yields null instead of sinking the whole request.
+				const getJson = async (url) => {
+					try {
+						const res = await originalFetch(url, { method: 'GET', credentials: 'include' });
+						if (!res.ok) return null;
+						return await res.json();
+					} catch {
+						return null;
+					}
+				};
+
+				const [bootstrap, organizations] = await Promise.all([
+					getJson('https://claude.ai/api/bootstrap'),
+					getJson('https://claude.ai/api/organizations')
+				]);
+				postResponse(requestId, true, { bootstrap, organizations }, null);
 				return;
 			}
 
